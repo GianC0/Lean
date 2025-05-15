@@ -1,0 +1,4 @@
+{
+    "python.pythonPath": "/scratch/project_2013416/Lean/.venv/bin/python3.11",
+    "python.languageServer": "Pylance"
+}
