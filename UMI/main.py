@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from info_nce_pytorch.loss import InfoNCELoss
 from torch_geometric.nn import GATConv
 import numpy as np
 import os
@@ -8,16 +9,21 @@ from QuantConnect.Data import SubscriptionDataSource
 from QuantConnect.Python import PythonData
 from AlgorithmImports import *
 
+
 # Stock-level Factor Learning Module
 class StockLevelFactorLearning(nn.Module):
     def __init__(self, stk_total, embedding_dim=16, dropout=0.1):
         super().__init__()
         self.stock_embeddings = nn.Embedding(stk_total, embedding_dim)
         self.beta = nn.Parameter(torch.randn(stk_total, stk_total))
+        # make sure no self‐cointegration by zeroing diagonal at init
+        with torch.no_grad():
+            self.beta.fill_diagonal_(0)
         self.rho = nn.Parameter(torch.zeros(stk_total))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, prices, stock_ids):
+
         """
         Compute virtual rational prices and irrationality factor u.
         - prices: Tensor of shape (B, I), batch of stock prices.
@@ -36,32 +42,32 @@ class StockLevelFactorLearning(nn.Module):
         ATT = self.dropout(ATT)
         
         # Apply cointegration attention
-        beta = self.beta.clone()
-        beta.diagonal().zero_()  # No self-contribution
         prices_expanded = prices.unsqueeze(2)  # (B, I, 1)
-        beta_expanded = beta[stock_ids, :][:, :, stock_ids]  # (B, I, I)
+        beta_expanded = self.beta[stock_ids, :][:, :, stock_ids]  # (B, I, I)
         candidate_prices = beta_expanded * prices_expanded  # (B, I, I)
         virtual_rational_prices = (ATT * candidate_prices).sum(dim=2)  # (B, I)
         u = virtual_rational_prices - prices  # Irrationality factor: (B, I)
         return virtual_rational_prices, u
 
-    def loss(self, prices, virtual_rational_prices, u, stock_ids, u_old_list):
+    def loss(self, prices, virtual_prices, u, stock_ids, u_old_list):
         """
         Compute stock-level loss with stationary regularization.
         - u_old_list: List of previous u values for each batch.
         """
-        B, I = prices.shape
-        loss1 = F.mse_loss(prices, virtual_rational_prices)  # Regression loss
+
+        def nclamp(x, min_val, max_val):
+            return x.clamp(min=min_val, max=max_val).detach() + x - x.detach()
+
+        B, _ = prices.shape
+        loss1 = F.mse_loss(prices, virtual_prices)  # Regression loss
         
         # Stationary regularization on u (matches provided code)
-        rho = torch.clamp(self.rho, -1, 1)  # Clamp rho between -1 and 1
+        rho = nclamp(self.rho, -1, 1)  # Clamp rho between -1 and 1
         loss2 = 0
         for b in range(B):
             u_old = torch.index_select(u_old_list[b], 0, stock_ids[b])  # (I,)
             rho_now = torch.index_select(rho, 0, stock_ids[b])  # (I,)
-            diff = u[b] - u_old * rho_now  # (I,)
-            square_diff = torch.pow(diff, 2)
-            loss2 = loss2 + square_diff.mean()
+            loss2 += ((u[b] - u_old * rho_now)**2).mean()
         loss2 = loss2 / B
         return loss1 + 0.5 * loss2  # Combine losses as per original
 
@@ -79,6 +85,9 @@ class MarketLevelFactorLearning(nn.Module):
         
         # Market comparison
         self.market_comp = nn.Linear(dim_model2, 1)  # Similar to stk_classification_small_2
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+        self.info_nce = InfoNCELoss(temperature=self.temperature)
+
         # Market prediction
         self.market_pred = nn.Sequential(
             nn.Linear(dim_model2 // 2, 16),
@@ -118,10 +127,9 @@ class MarketLevelFactorLearning(nn.Module):
         
         embed1 = self.compute_market_factor(u, stock_ids[group1])  # (dim_model2 // 2)
         embed2 = self.compute_market_factor(u, stock_ids[group2])  # (dim_model2 // 2)
-        concat = torch.cat([embed1, embed2]).unsqueeze(0)  # (1, dim_model2)
-        score = self.market_comp(concat)  # (1, 1)
-        label = torch.zeros(1, dtype=torch.long, device=u.device)
-        loss1 = F.cross_entropy(score.unsqueeze(0), label)  # Comparative loss
+        q = F.normalize(embed1, dim=-1).unsqueeze(0)     # (1, D)
+        k_pos = F.normalize(embed2, dim=-1).unsqueeze(0)     # (1, D)
+        loss1 = self.info_nce(q, k_pos)  # InfoNCE loss
         
         # Market synchronism prediction
         total_embed = self.compute_market_factor(u, stock_ids)
@@ -132,8 +140,10 @@ class MarketLevelFactorLearning(nn.Module):
         labels[S > H_m] = 0  # Positive
         labels[S < -H_m] = 1  # Negative
         labels[(S >= -H_m) & (S <= H_m)] = 2  # Neutral
-        pred = self.market_pred(total_embed.unsqueeze(0))  # (1, 3)
-        loss2 = F.cross_entropy(pred, labels[-1].unsqueeze(0))  # Last time step
+        # -- sliding‐window CE over all T-1 steps --
+        seq_embed = total_embed.unsqueeze(0).repeat(T-1, 1)     # (T-1, D)
+        pred      = self.market_pred(seq_embed)                # (T-1, 3)
+        loss2     = F.cross_entropy(pred, labels)             # sum/avg CE
         return loss1 + loss2
 
 # Forecasting Module
@@ -146,6 +156,7 @@ class UMIForecastingModel(nn.Module):
         self.fc_out = nn.Linear(dim_model + add_xdim, 1)  # Incorporates market factor
         self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, dim_model))
         self.dropout = nn.Dropout(dropout)
+        self.seq_len = seq_len
 
     def forward(self, x, addi_x=None):
         """
@@ -242,6 +253,11 @@ class UMIModelAlgorithm(QCAlgorithm):
                 optimizer_factor.zero_grad()
                 loss.backward()
                 optimizer_factor.step()
+                # re-normalize β to row-softmax + zero‐diag
+                with torch.no_grad():
+                    b = self.model.stock_level.beta.data
+                    b.copy_(F.softmax(b, dim=1))
+                    b.fill_diagonal_(0)
                 total_loss += loss.item()
                 
                 # Update u_old_list
