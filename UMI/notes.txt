@@ -1,0 +1,2 @@
+define 1 train function to be used for hp opt and future trains.
+ensure now = pd.Timestamp.utcnow() refers to backtest/live
