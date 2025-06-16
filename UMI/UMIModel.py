@@ -37,6 +37,20 @@ _FREQ2PANDAS = {
 
 DEFAULT_DB_URL = "sqlite:///umi_hp_optimization.db"
 
+
+
+# ───────────────────────────────────────────────────────────
+#  NEW ─ global, reusable search-space dictionary
+# ───────────────────────────────────────────────────────────
+HP_SEARCH_SPACE: dict[str, tuple] = {
+    "lambda_ic":     (0.01, 1.0),
+    "lambda_sync":   (0.1, 5.0),
+    "lambda_rankic": (0.01, 1.0),
+    "temperature":   (0.03, 0.2),
+    "sync_thr":      (0.5, 0.8),
+    "lr":            ("log", 1e-4, 5e-3),    # flag first element ⇒ log-uniform
+}
+
 # --------------------------------------------------------------------------- #
 # 1. Dataset that yields sliding windows ready for the factor blocks          #
 # --------------------------------------------------------------------------- #
@@ -101,7 +115,7 @@ def build_panel(data_dict: Dict[str, "pd.DataFrame"]) -> torch.Tensor:
     # ---------- proper pivot ---------------------------------------------- #
     df_pivot = long.pivot_table(
         values=feature_cols,      # every feature
-        index=long.index,         # <-- FIX 3: pivot on real index :contentReference[oaicite:2]{index=2}
+        index=long.index,         #
         columns="stock"
     ).sort_index()
 
@@ -144,7 +158,7 @@ class UMIModel:
         self.retrain_delta  = pd.Timedelta(retrain_every)
         self.end_train      = pd.Timestamp(end_train)
         self.end_valid      = pd.Timestamp(end_valid)
-        self.end_test       = pd.Timestamp(end_test) if end_test else None
+        self.end_test       = pd.Timestamp(end_test) 
         self.tune           = tune_hparams
         self.trials         = tune_trials
         self.hp             = self._default_hparams()
