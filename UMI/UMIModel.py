@@ -48,7 +48,7 @@ HP_SEARCH_SPACE: dict[str, tuple] = {
     "lambda_rankic": (0.01, 1.0),
     "temperature":   (0.03, 0.2),
     "sync_thr":      (0.5, 0.8),
-    "lr":            ("log", 1e-4, 5e-3),    # flag first element ⇒ log-uniform
+    "lr":            ("log", 1e-4, 5e-3),    #  log-uniform
 }
 
 # --------------------------------------------------------------------------- #
@@ -145,9 +145,10 @@ class UMIModel:
         end_train: str,
         end_valid: str,
         end_test: Optional[str],
+        clock_fn: Optional[Callable[[], "pd.Timestamp"]] = None,
         retrain_every: str = "30d",
         tune_hparams: bool = False,
-        tune_trials: int = 50,
+        tune_trials: int = 20,
         self.n_epochs: int = 20,
         **hparams,
     ):
@@ -164,7 +165,7 @@ class UMIModel:
         self.hp             = self._default_hparams()
         self.hp.update(hparams)
         self._tuning_done = False   # flag to avoid re-tuning of hyper-params
-
+        self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow
         self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         #self._world_size    = dist.get_world_size() if dist.is_initialized() else 1
         #self._rank          = dist.get_rank() if dist.is_initialized() else 0
@@ -172,7 +173,7 @@ class UMIModel:
         self._last_fit_time = None
         self._model_dir     = None
 
-    # ---------------- hyper-param defaults --------------------------- #
+    # ---------------- hyper-param defaults and suggest function--------------------------- #
     def _default_hparams(self) -> Dict[str, Any]:
         return dict(
             lambda_ic     = 0.1,
@@ -183,6 +184,16 @@ class UMIModel:
             lr            = 1e-3,
             weight_decay  = 0.0,
         )
+    
+    def _suggest_from_space(trial: "optuna.Trial") -> dict[str, float]:
+    """Utility used by *every* Optuna call so the space is defined once."""
+    hp = {}
+    for k, rng in HP_SEARCH_SPACE.items():
+        if isinstance(rng[0], str) and rng[0] == "log":
+            hp[k] = trial.suggest_float(k, rng[1], rng[2], log=True)
+        else:
+            hp[k] = trial.suggest_float(k, rng[0], rng[1])
+    return hp
 
     # ---------------- sub-module builder ----------------------------- #
     def _build_submodules(self):
@@ -219,6 +230,45 @@ class UMIModel:
         #    )
 
     # ---------------- training utilities ----------------------------- #
+    
+    # ------------ quick eval helper (MSE on loader) ------------------- #
+    def _eval(self, loader: "DataLoader") -> float:
+        self.stock_factor.eval(); self.market_factor.eval(); self.forecaster.eval()
+        tot = 0.0
+        with torch.no_grad():
+            for p_seq, f_seq, tgt in loader:
+                p_seq, f_seq, tgt = p_seq.to(self._device), f_seq.to(self._device), tgt.to(self._device)
+                u_seq, r_t, m_t, _, _ = self._stage1_forward(p_seq, f_seq)
+                _, loss, _ = self._stage2_forward(f_seq, u_seq, r_t, m_t, tgt)
+                tot += loss.item()
+        return tot / len(loader)
+
+    # ------------ shared training routine ---------------------------- #
+    def _train(self,
+               loader_train: "DataLoader",
+               loader_valid: Optional["DataLoader"],
+               n_epochs: int) -> float:
+        """Runs *n_epochs* and returns best validation MSE."""
+        opt_s = torch.optim.AdamW(self.stock_factor.parameters(), lr=self.hp["lr"],
+                                  weight_decay=self.hp.get("weight_decay", 0))
+        opt_m = torch.optim.AdamW(self.market_factor.parameters(), lr=self.hp["lr"],
+                                  weight_decay=self.hp.get("weight_decay", 0))
+        opt_f = torch.optim.AdamW(self.forecaster.parameters(),    lr=self.hp["lr"],
+                                  weight_decay=self.hp.get("weight_decay", 0))
+
+        best_val = math.inf
+        for ep in range(n_epochs):
+            trn = self._train_epoch(loader_train, opt_s, opt_m, opt_f)
+            if loader_valid is not None:
+                val = self._eval(loader_valid)
+                best_val = min(best_val, val)
+            else:
+                val = float("nan")
+            if ep == 0 or (ep + 1) % max(1, n_epochs // 5) == 0:
+                print(f"epoch {ep:>3} | train loss {trn:8.5f} | valid loss {val:8.5f} | best valid {best_val:8.5f}")
+        return best_val
+    
+    
     def _train_epoch(self, loader, optim_s, optim_m, optim_f):
         self.stock_factor.train(); self.market_factor.train(); self.forecaster.train()
         total = 0
@@ -245,8 +295,29 @@ class UMIModel:
 
     # ---------------- stage1 / stage2 wrappers ----------------------- #
     def _stage1_forward(self, prices_seq, feat_seq):
+        """Run stock-level & market-level factor learning *concurrently*."""
         stockIDs = torch.eye(prices_seq.size(2), device=prices_seq.device)
-        return self.market_factor.stage1_forward(prices_seq, feat_seq, stockIDs)
+        if torch.cuda.is_available():
+            # ---- GPU: two independent CUDA streams ------------------- #
+            stream_s = torch.cuda.Stream()
+            stream_m = torch.cuda.Stream()
+            with torch.cuda.stream(stream_s):
+                u_seq, r_t, loss_s = self.stock_factor(prices_seq, stockIDs)
+            with torch.cuda.stream(stream_m):
+                m_t, loss_m = self.market_factor(feat_seq, stockIDs)
+            torch.cuda.synchronize()         # wait for both streams
+        else:
+            # ---- CPU fallback: simple Python threads ----------------- #
+            def _run_stock(): return self.stock_factor(prices_seq, stockIDs)
+            def _run_market(): return self.market_factor(feat_seq,   stockIDs)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fu_s = pool.submit(_run_stock)
+                fu_m = pool.submit(_run_market)
+                u_seq, r_t, loss_s = fu_s.result()
+                m_t,             loss_m = fu_m.result()
+
+        loss_factors = loss_s + loss_m
+        return u_seq, r_t, m_t, loss_factors, None
 
     def _stage2_forward(self, feat_seq, u_seq, r_t, m_t, target):
         stockIDs = torch.eye(feat_seq.size(2), device=feat_seq.device)
@@ -281,43 +352,13 @@ class UMIModel:
         )
         loader_valid = DataLoader(ds_valid, batch_size=32)
 
-        # optuna objective ----------------------------------------------------
+        # ------------------------- Optuna objective ----------------------------
         def objective(trial):
-            #if dist.is_initialized() and dist.get_rank() != 0:
-            #    return float("inf")  # only rank-0 does tuning
-
-            # sample hyper-params
-            for key, rng in [
-                ("lambda_ic",   (0.01, 1.0)),
-                ("lambda_sync", (0.1,  5.0)),
-                ("lambda_rankic", (0.01, 1.0)),
-                ("temperature", (0.03, 0.2)),
-                ("sync_thr",    (0.5, 0.8)),
-                ("lr",          (1e-4, 5e-3)),
-            ]:
-                self.hp[key] = trial.suggest_float(key, *rng, log=True) if key == "lr" \
-                               else trial.suggest_float(key, *rng)
-
+            self.hp.update(_suggest_from_space(trial))
             self._build_submodules()
-            opt_s = torch.optim.AdamW(self.stock_factor.parameters(),  lr=self.hp["lr"])
-            opt_m = torch.optim.AdamW(self.market_factor.parameters(), lr=self.hp["lr"])
-            opt_f = torch.optim.AdamW(self.forecaster.parameters(),    lr=self.hp["lr"])
+            return self._train(loader_train, loader_valid, n_epochs=1)  # single-epoch eval
 
-            # single epoch for speed; you can loop more
-            self._train_epoch(loader_train, opt_s, opt_m, opt_f)
-
-            # validation
-            self.stock_factor.eval(); self.market_factor.eval(); self.forecaster.eval()
-            mse_valid = 0
-            with torch.no_grad():
-                for p_seq, f_seq, tgt in loader_valid:
-                    p_seq, f_seq, tgt = p_seq.to(self._device), f_seq.to(self._device), tgt.to(self._device)
-                    u_seq, r_t, m_t, _, _ = self._stage1_forward(p_seq, f_seq)
-                    preds, loss, _ = self._stage2_forward(f_seq, u_seq, r_t, m_t, tgt)
-                    mse_valid += loss.item()
-            return mse_valid / len(loader_valid)
-
-        # run tuning or just plain training
+         # ------------------------- run tuning / skip ---------------------------
         if self.tune and not self._tuning_done:
             db_url     = os.getenv("STORAGE_URL", DEFAULT_DB_URL)
             study_name = os.getenv("STUDY_NAME", "umi_opt")
@@ -326,27 +367,16 @@ class UMIModel:
                 engine_kwargs={"connect_args": {"timeout": 30}, "pool_pre_ping": True}
                 )
 
-
             study = optuna.create_study(study_name=study_name, storage=storage, direction="minimize", load_if_exists=True)
             study.optimize(objective, n_trials=self.trials)
             self.hp.update(study.best_params)
+            self._tuning_done = True
             #if self._rank == 0:
             print("Best hyper-params:", study.best_params)
 
-        # final train on train+valid
+        # ------------------------- final training on train+valid------------------------------
         self._build_submodules()
-        opt_s = torch.optim.AdamW(self.stock_factor.parameters(),  lr=self.hp["lr"],
-                                  weight_decay=self.hp["weight_decay"])
-        opt_m = torch.optim.AdamW(self.market_factor.parameters(), lr=self.hp["lr"],
-                                  weight_decay=self.hp["weight_decay"])
-        opt_f = torch.optim.AdamW(self.forecaster.parameters(),    lr=self.hp["lr"],
-                                  weight_decay=self.hp["weight_decay"])
-
-        # simple training loop
-        for epoch in range(self.n_epochs):  # small epoch count for brevity
-            loss_epoch = self._train_epoch(loader_train, opt_s, opt_m, opt_f)
-            #if self._rank == 0:
-            print(f"epoch {epoch} train_loss {loss_epoch:.4f}")
+        _ = self._train(loader_train, loader_valid=None, n_epochs=self.n_epochs)
 
         # save
         #if self._rank == 0:
@@ -365,7 +395,7 @@ class UMIModel:
         if self._last_fit_time is None:
             raise RuntimeError("Call fit() before update().")
 
-        now = pd.Timestamp.utcnow()     #### change to current time backtesting or live
+        now = self._clock()        # <── the only place we read “time”
         if now - self._last_fit_time >= self.retrain_delta:
             print("Retraining triggered …")
             self.fit(new_data_dict)

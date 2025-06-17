@@ -1,4 +1,40 @@
-define hp dictionary
-define 1 train function to be used for hp opt and future trains.
+ensure stockIDs is correct
 ensure now = pd.Timestamp.utcnow() refers to backtest/live
-parallelize training: step 1 both stocks and market factors. step 2 forecasting
+do the following to adapt to optuna:
+
+    Data source & symbol mapping
+
+        Replace build_panel() with a version that accepts Lean Slice objects (data.Bars[symbol].Close, etc.) or uses History() calls for warm-up.
+
+        Introduce a symbol ↔ integer map that survives symbol-changes and corporate actions.
+
+    Deterministic randomness
+
+        Lean runs the same back-test many times; fix torch.manual_seed / np.random.seed from the algorithm’s Initialize() to guarantee reproducibility.
+
+    Checkpoint storage
+
+        Lean’s local runner mounts /cache and /storage differently than a plain file-system.
+        Refactor the save/load paths to use self.ObjectStore or self.Debug-checked folders.
+
+    On-data glue code
+
+        Wrap predict() inside a QCAlgorithm extension (class UmiAlphaModel(AlphaModel): def Update(self, algorithm, data): ...) so signals flow into the portfolio.
+
+    Warm-up & incremental fitting
+
+        Move the first fit() call into OnWarmupFinished() or after History() is fetched, then let update() be driven by ScheduledEvent so it fires every self.retrain_delta.
+
+    Device selection
+
+        QuantConnect local runner may or may not expose GPUs; detect this via algorithm.IsLocal + os.environ["CUDA_VISIBLE_DEVICES"], falling back to CPU.
+
+    Thread safety
+
+        The concurrent stage-1 code is fine locally but Lean cloud back-tests run single-threaded; guard ThreadPoolExecutor with algorithm.IsLive or algorithm.IsLocal.
+
+    Parameter hand-off
+
+        Expose clock_fn = lambda: algorithm.Time and call umi = UMIModel(..., clock_fn=lambda: algorithm.Time) in Initialize().
+
+Implementing those eight bullets will make the wrapper fully plug-and-play inside a Lean project, but they touch Lean-specific APIs so I’ve enumerated them rather than editing your pure-PyTorch file.
