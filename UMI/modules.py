@@ -57,7 +57,7 @@ class StockLevelFactorLearning(nn.Module):
     def rho(self):
         return torch.tanh(self._rho)  # ensures ρ ∈ (‑1,1)
 
-    def forward(self, prices_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    def forward(self, prices_seq: torch.Tensor, active_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         # prices_seq : (B, L+1, I)
         B, L1, I = prices_seq.shape
         assert I == self.I
@@ -66,6 +66,16 @@ class StockLevelFactorLearning(nn.Module):
         attn = F.softmax(attn, 1)
         virt = prices_seq @ beta.t()            # (B,L+1,I)
         u_seq = virt @ attn.t()                 # (B,L+1,I)
+
+        # ─── Masking out delisted/removed stocks ─────────────────────────────────────
+        if active_mask is not None:
+            m = active_mask.unsqueeze(1).unsqueeze(1)     # (B,1,1,I)
+            prices_seq = prices_seq * m
+            virt       = virt       * m
+            u_seq      = u_seq      * m
+
+
+        # ─── Losses ─────────────────────────────────────────────────────────────────
         loss_beta = F.mse_loss(prices_seq, virt.detach())
         loss_station = F.mse_loss(u_seq[:, 1:], self.rho * u_seq[:, :-1])
         loss = loss_beta + self.lambda_ic * loss_station
@@ -97,6 +107,7 @@ class MarketLevelFactorLearning(nn.Module):
         self.F = feature_dim
         self.out_dim = 2 * feature_dim      # because of concatenation
         self.L = window_L
+        self.sync_threshold = sync_threshold            # threshold for events synchronism 
 
         # shared map W_s : ℝ^F → ℝ^F
         self.W_s = nn.Linear(feature_dim, feature_dim, bias=True)
@@ -122,25 +133,31 @@ class MarketLevelFactorLearning(nn.Module):
     def _compute_m_t(
         self,
         e_window: torch.Tensor,   # (B,Lτ,I,F)
-        stockID: torch.Tensor,    # (B,I,I) one-hot matrix
+        stockID_b: torch.Tensor,    # (B,I,I) one-hot matrix
+        active_mask: Optional[torch.Tensor] = None,  # (B,I) mask for active stocks
     ) -> Tuple[torch.Tensor, torch.Tensor]:
             """
             Returns (r_t , m_t) for a given window ending at τ.
             r_t : (B,I,2F)   — dynamic stock embedding
             m_t : (B,2F)     — market vector
             """
-            B, Lτ, I, F = e_window.shape
+            B, Lτ, I, f = e_window.shape
+
+            if active_mask is not None:
+                # zero out dead columns before any linear or attention op
+                m = active_mask.unsqueeze(1).unsqueeze(-1)        # (B,1,I,1)
+                e_window = e_window * m
             e_t   = e_window[:, -1]                     # (B,I,F)
             k_win = self.W_s(e_window)                  # (B,Lτ,I,F)
             q_t   = self.W_s(e_t)                       # (B,I,F)
 
-            scores = torch.einsum("bif,blif->bli", q_t, k_win) / math.sqrt(F)
+            scores = torch.einsum("bif,blif->bli", q_t, k_win) / math.sqrt(f)
             ATT    = scores.softmax(1)                  # (B,Lτ,I)
 
             r_hist = torch.einsum("bli,blif->bif", ATT, e_window)  # (B,I,F)
             r_t    = torch.cat([e_t, r_hist], -1)                  # (B,I,2F)
 
-            eta_in = self.W_iota(stockID) + r_t                    # (B,I,2F)
+            eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
             eta    = F.relu(torch.einsum("bid,d->bi", eta_in, self.w_eta))
             m_t    = self._weighted_mean(eta, r_t)                 # (B,2F)
             return r_t, m_t, eta
@@ -149,6 +166,7 @@ class MarketLevelFactorLearning(nn.Module):
         self,
         e_seq: torch.Tensor,      # (B,T,I,F)
         stockID: torch.Tensor,    # (I,I) identity matrix
+        active_mask: Optional[torch.Tensor] = None,  # (B,I) mask for active stocks
         close_idx: int = 3,       # OHLCV index from 0 to
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
@@ -166,7 +184,7 @@ class MarketLevelFactorLearning(nn.Module):
 
         # ---------------- current period (t = T-1) ----------------
         L_cur  = min(self.L, T)
-        r_t, m_t, _ = self._compute_m_t(e_seq[:, -L_cur:], stockID_b)  # (B,I,2F) , (B,2F)
+        r_t, m_t, _ = self._compute_m_t(e_seq[:, -L_cur:], stockID_b, active_mask)  # (B,I,2F) , (B,2F)
 
         # ---------------- contrastive InfoNCE (Eq. 20-21) ---------
         m1_list, m2_list, period_ids = [], [], []
@@ -176,7 +194,7 @@ class MarketLevelFactorLearning(nn.Module):
             S1, S2 = idx[: I // 2], idx[I // 2 :]
 
             Lτ = min(self.L, τ + 1)
-            r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b)
+            r_τ, m_τ, eta_τ= self._compute_m_t(e_seq[:, τ - Lτ + 1 : τ + 1], stockID_b, active_mask)  # (B,I,2F), (B,2F), (B,I,2F)
             m1 = self._weighted_mean(eta_τ[:, S1], r_τ[:, S1])  # (B,2F)
             m2 = self._weighted_mean(eta_τ[:, S2], r_τ[:, S2])  # (B,2F)
             m1_list.append(m1) ; m2_list.append(m2)
@@ -188,12 +206,14 @@ class MarketLevelFactorLearning(nn.Module):
 
         # ---------------- synchronism labels (Eq. 15) ----------------
         close = e_seq[..., close_idx]                      # (B,T,I)
+        if active_mask is not None:
+            close = close * active_mask.unsqueeze(1)
         ret   = torch.log(close[:, 1:] / (close[:, :-1] + 1e-8))  # (B,T-1,I)
         pos_ratio = (ret > 0).float().mean(-1)             # (B,T-1)
         neg_ratio = (ret < 0).float().mean(-1)             # (B,T-1)
         sync_lbls = torch.where(
-            pos_ratio >= self.thr, 0,
-            torch.where(neg_ratio >= self.thr, 1, 2)
+            pos_ratio >= self.sync_threshold, 0,
+            torch.where(neg_ratio >= self.sync_threshold, 1, 2)
         )                                                  # (B,T-1)
 
         # compute m_{t-1} for every t
@@ -222,7 +242,7 @@ class MarketLevelFactorLearning(nn.Module):
 ###############################################################################
 
 
-class UMIForecastingModel(nn.Module):
+class ForecastingLearning(nn.Module):
     """
     Inputs
     -------
@@ -254,8 +274,7 @@ class UMIForecastingModel(nn.Module):
 
         # ───── Transformer encoder over g_t = [e_t ∥ u_t]  (Eq. 25) ───── #
         self.encoder = TransformerEncoder(
-            TransformerEncoderLayer(self.D_enc, 4, batch_first=True), 2
-        )
+            TransformerEncoderLayer(self.D_enc, 4, batch_first=True), 2)
 
         # ───── Stock-relation parameters  (Eq. 26) ───── #
         self.W_iota  = W_iota                       # shared weights
@@ -282,6 +301,7 @@ class UMIForecastingModel(nn.Module):
         m_t:   torch.Tensor,      # (B,2F)
         stockID: torch.Tensor,    # (I,I)
         target: Optional[torch.Tensor] = None,
+        active_mask: Optional[torch.Tensor] = None,  # (B,I) mask for active stocks
     ):
         B, L, I, _ = e_seq.shape
         assert I == self.I, "stock dimension mismatch"
@@ -311,8 +331,13 @@ class UMIForecastingModel(nn.Module):
         loss      = torch.tensor(0.0, device=e_seq.device)
         rank_loss = torch.tensor(0.0, device=e_seq.device)
         if target is not None:
-            mse   = F.mse_loss(out, target.squeeze(-1))
-            rank_loss = 1 - rank_ic(out, target.squeeze(-1))
+            target = target.squeeze(-1)  # (B,I)
+            if active_mask is not None:
+                mask = active_mask.float()                         # (B,I)
+                out = out * mask
+                tgt_masked = target * mask
+            mse   = F.mse_loss(out, target)
+            rank_loss = 1 - rank_ic(out, target)
             loss = mse + self.lambda_rankic * rank_loss
 
         return out, loss, {"rank_loss": rank_loss.detach()}
