@@ -33,14 +33,14 @@ import re
 #  NEW ─ global, reusable search-space dictionary
 # ───────────────────────────────────────────────────────────
 HP_SEARCH_SPACE: dict[str, tuple] = {
-    "lambda_ic":     (0.1, 1.0),
-    "lambda_sync":   (0.1, 1.0),
-    "lambda_rankic": (0.1, 1.0),
+    "lambda_ic":     [0, 0.25, 0.5, 0.75, 1],    # taken from the official UMI paper
+    "lambda_sync":   [0, 0.5, 1, 1.5, 2],        # taken from the official UMI paper
+    "lambda_rankic": [0, 0.05, 0.1, 0.15, 0.2],  # taken from the official UMI paper
     "temperature":   (0.03, 0.2),
-    "sync_thr":      (0.5, 0.8),        # TODO: define a better range
-    "lr_stage1":    ("log", 1e-4, 5e-3),   # pre-training
-    "lr_stage1_ft": ("log", 1e-5, 1e-3),   # fine-tune during joint phase
-    "lr_stage2":    ("log", 1e-5, 1e-3),   # forecasting head
+    "sync_thr":      (0.5, 0.8),                 # TODO: define a better range
+    "lr_stage1":    ("log", 1e-4, 5e-3),         # pre-training
+    "lr_stage1_ft": ("log", 1e-5, 1e-3),         # fine-tune during joint phase
+    "lr_stage2":    ("log", 1e-5, 1e-3),         # forecasting head
 }
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +230,8 @@ class UMIModel(nn.Module):
         for k, rng in HP_SEARCH_SPACE.items():
             if isinstance(rng[0], str) and rng[0] == "log":
                 hp[k] = trial.suggest_float(k, rng[1], rng[2], log=True)
+            elif "lambda_" in k:
+                hp[k] = trial.suggest_categorical(k, rng)
             else:
                 hp[k] = trial.suggest_float(k, rng[0], rng[1])
         return hp

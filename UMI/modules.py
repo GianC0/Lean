@@ -16,8 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer, LayerNorm
-from torch.distributed import is_initialized as dist_is_initialized
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 ###############################################################################
 # Utility losses & metrics                                                    #
@@ -283,9 +281,17 @@ class ForecastingLearning(nn.Module):
         self.D_enc    = feature_dim + u_dim        # encoder hidden size
         self.D_market = 2 * feature_dim            # r_t and m_t dim
 
+        head_dim_target = 16          # ≈ sweet-spot per-head size
+        max_heads        = 8          # don’t explode memory on small GPUs
+        nhead = max(1, min(max_heads, self.D_enc // head_dim_target))
+        while self.D_enc % nhead != 0 and nhead > 1:   # make it divide cleanly
+            nhead -= 1
+        self.nhead = nhead
+
         # ───── Transformer encoder over g_t = [e_t ∥ u_t]  (Eq. 25) ───── #
+        self.pos_enc = PositionalEncoding(self.D_enc)
         self.encoder = TransformerEncoder(
-            TransformerEncoderLayer(self.D_enc, 4, batch_first=True), 2)
+            TransformerEncoderLayer(d_model=self.D_enc, nhead=self.nheads, batch_first=True), num_layers=2, norm=nn.LayerNorm(self.D_enc))
 
         # ───── Stock-relation parameters  (Eq. 26) ───── #
         self.W_iota  = W_iota                       # shared weights
@@ -319,7 +325,9 @@ class ForecastingLearning(nn.Module):
 
         # ── 1. Encode g_t = [e_t ∥ u_t] ─────────────────────────────── #
         g = torch.cat([e_seq, u_seq.unsqueeze(-1)], -1)         # (B,L,I,D_enc)
-        enc_flat = self.encoder(g.reshape(B * I, L, -1))        # (B·I,L,D_enc)
+        g_flat = g.reshape(B * I, L, -1)
+        g_flat  = self.pos_enc(g_flat)                          # add positions
+        enc_flat = self.encoder(g_flat)                         # (B·I,L,D_enc)
         enc = enc_flat.view(B, I, L, -1)                        # (B,I,L,D_enc)
         c_t   = enc[:, :, -1]                                   # (B,I,D_enc)
         c_prev = enc[:, :, -2] if L > 1 else c_t                # safety fallback
@@ -353,3 +361,30 @@ class ForecastingLearning(nn.Module):
 
         return out, loss, {"rank_loss": rank_loss.detach()}
 
+
+
+################################################################################
+# Helper class Positional Encoding for Transformer models
+################################################################################
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.0, max_len: int = 200):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10_000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)          # (1, max_len, d_model)  -> broadcastable
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, L, d_model)
+        """
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)

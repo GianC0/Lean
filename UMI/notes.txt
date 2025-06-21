@@ -1,5 +1,4 @@
-foreasting: Transformer encoder
-finish the main logic ( .fit + .update + predict only until next update)
+RUN!!!
 integrate in lean
 
 do the following to adapt to optuna:
