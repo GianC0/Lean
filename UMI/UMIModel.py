@@ -27,12 +27,6 @@ import optuna
 from sqlalchemy.exc import OperationalError
 from optuna.storages import RDBStorage
 import re
-import pandas as pd
-# --------------------------------------------------------------------------- #
-# small helper – convert a frequency string like “15m” → pandas offset alias #
-# --------------------------------------------------------------------------- #
-DEFAULT_DB_URL = 
-
 
 
 # ───────────────────────────────────────────────────────────
@@ -61,7 +55,7 @@ class SlidingWindowDataset(Dataset):
     """
     def __init__(
         self,
-        panel: torch.Tensor,      # (T, I, F) F includes "close" as first idx
+        panel: torch.Tensor,      # (T, I, F) F includes "close" at close_idx position
         active: torch.Tensor,     # (I, T) bool mask for active stocks
         window_len: int,
         pred_len: int,
@@ -159,7 +153,7 @@ class UMIModel(nn.Module):
         retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
         dynamic_universe_mult: float | int = 2,        
         tune_hparams: bool = False,
-        tune_trials: int = 20,
+        n_trials: int = 20,
         n_epochs: int = 20,
         batch_size: int = 64,
         training_mode: str="sequential",    # hybrid/sequential:
@@ -190,6 +184,7 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs                              # number of epochs for training
         self.pretrain_epochs = pretrain_epochs                      # epochs for Stage-1 pre-training (hybrid mode)
         self._model_dir     = model_dir                             # directory where the model is saved
+        self.training_mode = training_mode                          # "hybrid" or "sequential"
         
         # stock universe
         self._universe: list[str] = []                              # stable “slot → ticker” mapping
@@ -198,10 +193,9 @@ class UMIModel(nn.Module):
         
         # training parameters
         self.batch_size     = batch_size                            # batch size for training
-        self.training_mode = training_mode                          # "hybrid" or "sequential"
         self.patience = patience                                    # early stopping patience epochs for any training stage
-        self.tune           = tune_hparams                          # whether to tune hyper-parameters
-        self.trials         = tune_trials                           # number of trials for Optuna tuning 
+        self.tune_hparams   = tune_hparams                          # whether to tune hyper-parameters
+        self.n_trials         = n_trials                           # number of trials for Optuna tuning 
         self._tuning_done = False                                   # flag to avoid re-tuning of hyper-params
         self.hp = self._default_hparams()                           # hyper-parameters
         self.hp.update(hparams)
@@ -575,20 +569,20 @@ class UMIModel(nn.Module):
         def objective(trial):
             self.hp.update(self._suggest_from_space(trial))
             self._build_submodules()
-            val = self._train(loader_train, loader_valid, n_epochs=1)  # single-epoch eval
+            val = self._train(loader_train, loader_valid, n_epochs=5)  # 5-epoch eval
             trial_log = self._model_dir / "hp_trials.csv"
             pd.DataFrame([dict(trial=trial.number, loss_pred=val)]).to_csv(trial_log, mode="a", header=not trial_log.exists(), index=False)
             return val
 
          # ------------------------- run tuning / skip ---------------------------
-        if self.tune and not self._tuning_done:
+        if self.tune_hparams and not self._tuning_done:
             storage = RDBStorage(              
                 self.storage_url,
                 engine_kwargs={"connect_args": {"timeout": 30}, "pool_pre_ping": True}
                 )
 
             study = optuna.create_study(study_name=self.study_name, storage=storage, direction="minimize", load_if_exists=True)
-            study.optimize(objective, n_trials=self.trials)
+            study.optimize(objective, n_trials=self.n_trials)
             self.hp.update(study.best_params)
             self._tuning_done = True
             print("Best hyper-params:", study.best_params)
@@ -622,11 +616,13 @@ class UMIModel(nn.Module):
 
         # ---------- build fresh activity mask at NOW ------------------
 
-        #  Add new tickers to the first free slot (None)
+        #  Add new tickers to the first free slots
         for k in sorted(new_data_dict):
             if k not in self._universe:
                 if len(self._universe) < self.I:        # capacity check
                     self._universe.append(k)            # reserve slot
+                    self.fit(new_data_dict)               # rebuild with larger I. fit will expand the universe
+                    return
                 else:
                     self._universe.append(k)              # give the new stock a slot
                     print(f"[info] universe full. Retraining …")
@@ -658,7 +654,7 @@ class UMIModel(nn.Module):
     # predict : one inference step                                       #
     # ------------------------------------------------------------------ #
     def predict(self, data_dict: Dict[str, "pd.DataFrame"]) -> Dict[str, float]:
-        panel, active, idx = build_panel(data_dict, self._universe)   # (T,I_active,F) , (I_active,T)
+        panel, active, idx = build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
 
         prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)
@@ -692,24 +688,23 @@ class UMIModel(nn.Module):
     # ------------------------------------------------------------------ #
     def state_dict(self) -> Dict[str, Any]:
         return {
-            "stock_factor":  self.stock_factor.module.state_dict()
-            if isinstance(self.stock_factor, nn.parallel.DistributedDataParallel)
-            else self.stock_factor.state_dict(),
-            "market_factor": self.market_factor.module.state_dict()
-            if isinstance(self.market_factor, nn.parallel.DistributedDataParallel)
-            else self.market_factor.state_dict(),
-            "forecaster":    self.forecaster.module.state_dict()
-            if isinstance(self.forecaster, nn.parallel.DistributedDataParallel)
-            else self.forecaster.state_dict(),
+            "I": self.I,
+            "F": self.F,
+            "L": self.L,
+            "stock_factor":  self.stock_factor.state_dict(),
+            "market_factor": self.market_factor.state_dict(),
+            "forecaster":    self.forecaster.state_dict(),
             "hparams": self.hp,
         }
 
     def load_state_dict(self, sd: Dict[str, Any]):
+        self.I, self.F, self.L = sd["I"], sd["F"], sd["L"]
         self.hp.update(sd["hparams"])
         self._build_submodules()
         self.stock_factor.load_state_dict(sd["stock_factor"])
         self.market_factor.load_state_dict(sd["market_factor"])
         self.forecaster.load_state_dict(sd["forecaster"])
+        assert self.I == sd["I"] and self.F == sd["F"]
 
 # ------------------------------------------------------------------ #
 #  Main guard: lets the file act as CLI for SLURM array jobs         #
@@ -717,7 +712,7 @@ class UMIModel(nn.Module):
 if __name__ == "__main__":
     import argparse, json, pandas as pd, os
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-json",   default="data/ohlcv_plus_indicators.json",
+    ap.add_argument("--data-dir",   default="stocks/all", help="directory with OHLCV data in format \{TICKER\}.csv")
                     help="dict-of-dataframes serialized via DataFrame.to_json")
     ap.add_argument("--freq", default="1d", help="frequency of the data, e.g. 1d, 15m, 1h")
     ap.add_argument("--window-len",  type=int, default=60)
@@ -725,17 +720,16 @@ if __name__ == "__main__":
     ap.add_argument("--dynamic-universe-mult", type=int, default=2, help="over-allocation factor for dynamic universe")   
     ap.add_argument("--training-mode", choices=["hybrid","sequential"], default="sequential",
                     help="hybrid: stage-1 pre-training, then joint training; sequential: stage-1 first, then stage-2")
-    ap.add_argument("--retrain-delta", default="30", help="time delta for retraining, e.g. 30d, 1w, 1h")
+    ap.add_argument("--retrain-delta", type=int, default=30, help="delta bars (time units) for retraining, e.g. 30, 300 minutes or days")
     ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
     ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
     ap.add_argument("--end-train",   default="2019-12-31")
     ap.add_argument("--end-valid",   default="2020-12-31")
     ap.add_argument("--end-test",    default=None, help="optional end date for test set")
     ap.add_argument("--study-name",  default=os.getenv("STUDY_NAME", "umi"))
-    ap.add_argument("--storage-url", default=os.getenv("STORAGE_URL", "sqlite:///umi_hp_optim.db"))
     ap.add_argument("--n-epochs",    type=int, default=30)
     ap.add_argument("--batch-size",    type=int, default=64)
-    ap.add_argument("--tune-hparams", type=bool, default=False)
+    ap.add_argument("--tune-hparams", action="store_false")
     ap.add_argument("--tune-trials", type=int, default=20)
     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
     ap.add_argument("storage_url", type=str, default="sqlite:///models/UMI/umi_hp_optimization.db",
@@ -746,34 +740,59 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     # ---------- load data -------------------------------------------
-    with open(args.data_json) as fp:
-        raw = json.load(fp)
-    data_dict = {k: pd.read_json(v, convert_dates=True) for k, v in raw.items()}
+    if args.data_dir is not None:
+        data_path = Path(args.data_dir)
+        if not data_path.is_dir():
+            raise FileNotFoundError(f"{data_path} is not a directory.")
+
+        data_dict: dict[str, pd.DataFrame] = {}
+        for csv_file in data_path.glob("*.csv"):
+            ticker = csv_file.stem.upper()          # file name → ticker
+
+            df = pd.read_csv(csv_file)
+
+            # -- make sure the index is a datetime index the rest of the code expects
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"], utc=True)
+                df.set_index("Date", inplace=True)
+            else:
+                raise ValueError(f"{csv_file} must contain a 'Date' column.")
+
+            # OPTIONAL – bring the classic OHLCV to the front so that
+            #           'Close' really is column #3 as the model defaults expect.
+            wanted = ["Open", "High", "Low", "Close"]
+            reorder = [c for c in wanted if c in df.columns] + [c for c in df.columns if c not in wanted]
+            df = df[reorder]
+            data_dict[ticker] = df
+    else:
+        raise ValueError("No data directory provided. Use --data-dir to specify the path to the data.")
 
     # ---------- build & fit -----------------------------------------
     # Each SLURM array task sees exactly one GPU thanks to CUDA_VISIBLE_DEVICES
     model = UMIModel(
         freq=args.freq,
-        feature_dim=len(data_dict[next(iter(data_dict))].columns),
+        feature_dim=len(next(iter(data_dict.values())).columns),
         window_len=args.window_len,
         pred_len=args.pred_len,
         end_train=args.end_train,
         end_valid=args.end_valid,
-        end_test=None,
-        tune_hparams=True,          # first run tunes
+        end_test=args.end_test,
+        tune_hparams=args.tune_hparams,          # first run tunes
         n_epochs=args.n_epochs,     # then trains for n_epochs
         batch_size=args.batch_size,
-        retrain_delta=pd.DateOffset(days=int(args.retrain_delta)),
+        retrain_delta=pd.DateOffset(days=args.retrain_delta),    # to modify if wanted hours or minutes
         dynamic_universe_mult=2,    # 2x over-allocation for dynamic universe
-        tune_trials=0,              # number controlled per-job via TRIALS_PER_JOB env
+        tune_trials=5,              # number controlled per-job via TRIALS_PER_JOB env
         study_name=args.study_name,
         storage_url=args.storage_url,
         training_mode=args.training_mode,
         pretrain_epochs=args.pretrain_epochs,
         patience=args.patience,
-        close_idx=args.close_idx,
+        close_idx=( args.close_idx if args.close_idx is not None else list(next(iter(data_dict.values())).columns).index("Close")),
         model_dir=args.model_dir,
-        storage_url=args.storage_url,
+        data_dir= 
     )
 
+    print(next(iter(data_dict.items()))[1].head())
+    print("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
     model.fit(data_dict)            # Optuna tuning occurs only once per study
