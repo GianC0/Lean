@@ -1,3 +1,14 @@
+"""
+Module definitions for the UMI (Unified Market Intelligence) framework.
+This module contains implementations for:
+1. Supervised InfoNCE loss
+2. Stock-level factor learning
+3. Market-level factor learning
+4. Forecasting model
+
+"""
+
+
 import math
 from typing import Tuple, Optional
 

@@ -1,6 +1,3 @@
-
-add some statistics for hempirical evaluation of hybrid loss training (few epochs stage1 then both), sequential (stage1 to minimum, then freeze with early stopping and start stage 2) or altogether (probably not worth it)
-hp tuning should use _eval function to evaluate separately all the losses (??)
 foreasting: Transformer encoder
 finish the main logic ( .fit + .update + predict only until next update)
 integrate in lean

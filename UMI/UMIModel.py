@@ -26,16 +26,12 @@ from torch.utils.data import Dataset, DataLoader
 import optuna
 from sqlalchemy.exc import OperationalError
 from optuna.storages import RDBStorage
+import re
+import pandas as pd
 # --------------------------------------------------------------------------- #
 # small helper – convert a frequency string like “15m” → pandas offset alias #
 # --------------------------------------------------------------------------- #
-_FREQ2PANDAS = {
-    "1m": "T", "5m": "5T", "15m": "15T", "30m": "30T",
-    "1h": "H", "2h": "2H", "4h": "4H",
-    "1d": "D",
-}
-
-DEFAULT_DB_URL = "sqlite:///umi_hp_optimization.db"
+DEFAULT_DB_URL = 
 
 
 
@@ -48,7 +44,9 @@ HP_SEARCH_SPACE: dict[str, tuple] = {
     "lambda_rankic": (0.1, 1.0),
     "temperature":   (0.03, 0.2),
     "sync_thr":      (0.5, 0.8),        # TODO: define a better range
-    "lr":            ("log", 1e-4, 5e-3),    #  log-uniform
+    "lr_stage1":    ("log", 1e-4, 5e-3),   # pre-training
+    "lr_stage1_ft": ("log", 1e-5, 1e-3),   # fine-tune during joint phase
+    "lr_stage2":    ("log", 1e-5, 1e-3),   # forecasting head
 }
 
 # --------------------------------------------------------------------------- #
@@ -131,11 +129,10 @@ def build_panel(data_dict: Dict[str, "pd.DataFrame"],
     if universe is not None:
         df_pivot = df_pivot.reindex( pd.MultiIndex.from_product([feature_cols, keys]), axis=1 )
 
-    values = torch.tensor(df_pivot.values, dtype=torch.float32)
-    active  = torch.isfinite(values).all(-1)          # (T, I_active)  bool
     T, F, I = len(df_pivot), len(feature_cols), len(keys)
-    tensor = values.reshape(T, F, I).transpose(0, 2, 1)  # → (T, I, F)
-    active  = active.transpose(0, 1)    # -> (I_active, T)
+    values = torch.tensor(df_pivot.values, dtype=torch.float32)
+    tensor = values.reshape(T, F, I).transpose(0,2,1) # (T,I,F)
+    active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
 
     return tensor, active, df_pivot.index       
 
@@ -145,8 +142,7 @@ def build_panel(data_dict: Dict[str, "pd.DataFrame"],
 class UMIModel(nn.Module):
     """
     Orchestrates factor learning + forecasting, periodic retraining, optional
-    hyper-parameter tuning, DDP-aware saving/loading.  Designed for both
-    back-tests and always-on live services.
+    hyper-parameter tuning.  Designed for both back-tests and always-on live services.
     """
 
     # ---------------- constructor ------------------------------------ #
@@ -158,48 +154,65 @@ class UMIModel(nn.Module):
         pred_len: int,
         end_train: str,
         end_valid: str,
-        end_test: Optional[str],
+        end_test: Optional[str] = None,
         clock_fn: Optional[Callable[[], "pd.Timestamp"]] = None,
-        retrain_every: str = "30d",
-        dynamic_universe_mult: float | int = 2,        #  ← over-allocation factor for dynamic-sized universe of stocks
+        retrain_delta: pd.DateOffset = pd.DateOffset(days=30),
+        dynamic_universe_mult: float | int = 2,        
         tune_hparams: bool = False,
         tune_trials: int = 20,
         n_epochs: int = 20,
         batch_size: int = 64,
-        training_mode: str="hybrid",    # hybrid/sequential:
+        training_mode: str="sequential",    # hybrid/sequential:
                                         # hybrid -> stage1 factors for few epochs, then stage2 altogether
                                         # sequential -> stage1 first until early stopping, then stage2
         pretrain_epochs:int=5,
-        patience:int=10,     # early stopping patience epochs for any training stage
+        patience:int=10,       
+        close_idx: int = 3,  # usually "close" is at index 3       
+        study_name: str = "UMIModel",
+        model_dir: str = "models/UMI",
+        storage_url: str = "sqlite:///models/UMI/umi_hp_optimization.db",
         **hparams,
     ):
-        self.freq           = freq
-        self.F              = feature_dim
-        self.L              = window_len
-        self.pred_len       = pred_len
-        self.universe_mult = max(1, int(dynamic_universe_mult))
-        self.retrain_delta  = pd.Timedelta(retrain_every)
-        self.end_train      = pd.Timestamp(end_train)
-        self.end_valid      = pd.Timestamp(end_valid)
-        self.end_test       = pd.Timestamp(end_test) 
-        self.tune           = tune_hparams
-        self.trials         = tune_trials
-        self.n_epochs       = n_epochs
-        self.batch_size     = batch_size
-        self.hp             = self._default_hparams()
-        self.training_mode = training_mode
-        self.pretrain_epochs = pretrain_epochs
-        self.patience = patience
-        self.hp.update(hparams)
-        self._tuning_done = False   # flag to avoid re-tuning of hyper-params
-        self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow
-        self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._universe: list[str] = []        # ← stable “slot → ticker” mapping
-        #self._world_size    = dist.get_world_size() if dist.is_initialized() else 1
-        #self._rank          = dist.get_rank() if dist.is_initialized() else 0
 
-        self._last_fit_time = None
-        self._model_dir     = None
+        # time parameters
+        self.freq           = freq                                               # e.g. "1d", "15m", "1h"
+        self.pred_len    = pred_len                                              # number of bars to predict
+        self.retrain_delta  = retrain_delta                                      # time delta for retraining 
+        self.end_train      = pd.Timestamp(end_train)                            # end of training date
+        self.end_valid      = pd.Timestamp(end_valid)                            # end of validation date
+        self.end_test       = pd.Timestamp(end_test)  if end_test else None      # end of test date (optional)
+        self._last_fit_time = None                                               # last time fit() was called
+        
+
+        # model parameters
+        self.F              = feature_dim                           # number of features per stock
+        self.L              = window_len                            # length of the sliding window (L+1 bars)
+        self.n_epochs       = n_epochs                              # number of epochs for training
+        self.pretrain_epochs = pretrain_epochs                      # epochs for Stage-1 pre-training (hybrid mode)
+        self._model_dir     = model_dir                             # directory where the model is saved
+        
+        # stock universe
+        self._universe: list[str] = []                              # stable “slot → ticker” mapping
+        self.universe_mult = max(1, int(dynamic_universe_mult))     # over-allocation factor for dynamic universe
+        self.close_idx = close_idx                                          # usually "close" is at index 3 in the dataframes
+        
+        # training parameters
+        self.batch_size     = batch_size                            # batch size for training
+        self.training_mode = training_mode                          # "hybrid" or "sequential"
+        self.patience = patience                                    # early stopping patience epochs for any training stage
+        self.tune           = tune_hparams                          # whether to tune hyper-parameters
+        self.trials         = tune_trials                           # number of trials for Optuna tuning 
+        self._tuning_done = False                                   # flag to avoid re-tuning of hyper-params
+        self.hp = self._default_hparams()                           # hyper-parameters
+        self.hp.update(hparams)
+        
+        # optuna parameters
+        self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow               # default clock function for live / back-test
+        self._device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")        # device for training
+        self.study_name = study_name                                                              # name of the Optuna study
+        self.storage_url = storage_url                                                            # database URL for Optuna storage
+        
+
 
     # ---------------- hyper-param defaults and suggest function--------------------------- #
     def _default_hparams(self) -> Dict[str, Any]:
@@ -211,11 +224,14 @@ class UMIModel(nn.Module):
             sync_thr      = 0.6,
             lr            = 1e-3,
             weight_decay  = 0.0,
+            lr_stage1      = 1e-3,
+            lr_stage1_ft   = 1e-4,
+            lr_stage2      = 1e-4,
         )
     
     @staticmethod
     def _suggest_from_space(trial: "optuna.Trial") -> dict[str, float]:
-    """Utility used by *every* Optuna call so the space is defined once."""
+        """Utility used by *every* Optuna call so the space is defined once."""
         hp = {}
         for k, rng in HP_SEARCH_SPACE.items():
             if isinstance(rng[0], str) and rng[0] == "log":
@@ -228,7 +244,7 @@ class UMIModel(nn.Module):
     def _build_submodules(self):
         I = self.I
         if not hasattr(self, "_eye") or self._eye.size(0) != I:
-            self.register_buffer("_eye", torch.eye(I, dtype=torch.float32))
+            self._eye = torch.eye(I, dtype=torch.float32)
 
         self.stock_factor = StockLevelFactorLearning(
             I, lambda_ic=self.hp["lambda_ic"]
@@ -248,17 +264,58 @@ class UMIModel(nn.Module):
             lambda_rankic=self.hp["lambda_rankic"],
         ).to(self._device)
 
-        # Wrap with DDP if needed
-        #if dist.is_initialized():
-        #    self.stock_factor  = nn.parallel.DistributedDataParallel(
-        #        self.stock_factor, device_ids=[self._rank]
-        #    )
-        #    self.market_factor = nn.parallel.DistributedDataParallel(
-        #        self.market_factor, device_ids=[self._rank]
-        #    )
-        #    self.forecaster    = nn.parallel.DistributedDataParallel(
-        #        self.forecaster, device_ids=[self._rank]
-        #    )
+    def _log_epoch(self, ep, l_s, l_m, l_p, *, val_pred=None):
+        row = dict(epoch=ep, loss_stock=l_s, loss_market=l_m,
+                loss_pred=l_p, val_pred=val_pred)
+        self._epoch_logs.append(row)
+        if self._model_dir:
+            fn = self._model_dir / "train_losses.csv"
+            hdr = not fn.exists()
+            pd.DataFrame([row]).to_csv(fn, mode="a", header=hdr, index=False)
+
+    # ────────────────────────────────────────────────────────────────
+    # helper – write out every file the visual notebook relies on
+    # ────────────────────────────────────────────────────────────────
+    def _dump_model_metadata(self):
+        """
+        Persists:
+        • param_inventory.csv   – per-tensor shape / #params / bytes
+        • run_meta.json         – run-time settings + totals
+        • hp_trials.csv         – Optuna scores (if it exists at project root)
+        """
+        
+        records, total_p, total_b = [], 0, 0
+        sd = self.state_dict()
+        for blk, obj in sd.items():
+            if isinstance(obj, dict):           # sub-module dict
+                for n, t in obj.items():
+                    numel = t.numel(); bytes_ = numel * t.element_size()
+                    records.append(dict(tensor=f"{blk}.{n}",
+                                        shape=list(t.shape),
+                                        numel=numel, bytes=bytes_))
+                    total_p += numel; total_b += bytes_
+            else:                               # flat tensor
+                numel = obj.numel(); bytes_ = numel * obj.element_size()
+                records.append(dict(tensor=blk, shape=list(obj.shape),
+                                    numel=numel, bytes=bytes_))
+                total_p += numel; total_b += bytes_
+
+        pd.DataFrame(records).to_csv(self._model_dir / "param_inventory.csv",
+                                    index=False)
+
+        meta = dict(
+            freq=self.freq, feature_dim=self.F, window_len=self.L,
+            pred_len=self.pred_len, end_train=str(self.end_train),
+            end_valid=str(self.end_valid), n_epochs=self.n_epochs,
+            dynamic_universe_mult=self.universe_mult, total_params=total_p,
+            approx_size_mb=round(total_b / 1024 / 1024, 3),
+        )
+        with open(self._model_dir / "run_meta.json", "w") as fp:
+            json.dump(meta, fp, indent=2)
+
+        root_trials = Path("hp_trials.csv")
+        if root_trials.exists():
+            shutil.copy(root_trials, self._model_dir / "hp_trials.csv")
 
     # ---------------- training utilities ----------------------------- #
     
@@ -275,92 +332,166 @@ class UMIModel(nn.Module):
         return tot / len(loader)
 
     # ------------ shared training routine ---------------------------- #
-    def _train(self,
-               loader_train: "DataLoader",
-               loader_valid: Optional["DataLoader"],
-               n_epochs: int) -> float:
-        """Runs *n_epochs* and returns best validation MSE."""
-        opt_s = torch.optim.AdamW(self.stock_factor.parameters(), lr=self.hp["lr"],
-                                  weight_decay=self.hp.get("weight_decay", 0))
-        opt_m = torch.optim.AdamW(self.market_factor.parameters(), lr=self.hp["lr"],
-                                  weight_decay=self.hp.get("weight_decay", 0))
-        opt_f = torch.optim.AdamW(self.forecaster.parameters(),    lr=self.hp["lr"],
-                                  weight_decay=self.hp.get("weight_decay", 0))
+    def _train( self, loader_train: "DataLoader", loader_valid: Optional["DataLoader"], n_epochs: int, ) -> float:
+        """ 
+        ONE entry-point that now handles all three schedules:
 
-        best_val = math.inf
-        for ep in range(n_epochs):
-            trn = self._train_epoch(loader_train, opt_s, opt_m, opt_f)
-            if loader_valid is not None:
-                val = self._eval(loader_valid)
-                best_val = min(best_val, val)
-            else:
+            • self.training_mode == "joint"      – unchanged behaviour
+            • self.training_mode == "hybrid"     – k warm-up epochs (Stage-1 only)
+                                                then joint fine-tune
+            • self.training_mode == "sequential" – Stage-1 with early-stop,
+                                                then Stage-2 only
+        Returns the best validation MSE seen across *all* phases. 
+        """
+
+        # ───────────────────────────── optimisers ──────────────────────────
+        opt_s = torch.optim.AdamW(self.stock_factor.parameters(),
+                                lr=self.hp["lr_stage1"],
+                                weight_decay=self.hp.get("weight_decay", 0))
+        opt_m = torch.optim.AdamW(self.market_factor.parameters(),
+                                lr=self.hp["lr_stage1"],
+                                weight_decay=self.hp.get("weight_decay", 0))
+        opt_f = torch.optim.AdamW(self.forecaster.parameters(),
+                                lr=self.hp["lr_stage2"],
+                                weight_decay=self.hp.get("weight_decay", 0))
+
+        best_val: float = math.inf
+        self._epoch_logs = []
+        ep = 0                         # global epoch counter for logging
+
+        # ────────────────────────── helper inner loop ─────────────────────
+        def _run_epochs(num: int) -> None:
+            nonlocal ep, best_val
+            for _ in range(num):
+                trn, l_s, l_m, l_pred = self._train_epoch(loader_train,
+                                                        opt_s, opt_m, opt_f)
+
                 val = float("nan")
-            if ep == 0 or (ep + 1) % max(1, n_epochs // 5) == 0:
-                print(f"epoch {ep:>3} | train loss {trn:8.5f} | valid loss {val:8.5f} | best valid {best_val:8.5f}")
+                if loader_valid is not None:
+                    val = self._eval(loader_valid)
+                    best_val = min(best_val, val)
+
+                if ep == 0 or (ep + 1) % max(1, (self.pretrain_epochs + n_epochs) // 5) == 0:
+                    print(f"ep {ep:>3} | train {trn:.5f} | val {val:.5f} | best {best_val:.5f}")
+
+                self._log_epoch(ep, l_s, l_m, l_pred, val_pred=val)
+                ep += 1
+
+        # ─────────────────────────── schedule switch ──────────────────────
+        if self.training_mode == "hybrid":
+            # 1) warm-up – Stage-1 only
+            print(f"[hybrid] warm-up Stage-1  ({self.pretrain_epochs} epochs)")
+            self.forecaster.requires_grad_(False)
+            _run_epochs(self.pretrain_epochs)
+
+            # 2) joint fine-tune
+            print(f"[hybrid] joint fine-tune  ({n_epochs} epochs)")
+            self.forecaster.requires_grad_(True)
+            for g in opt_s.param_groups + opt_m.param_groups:
+                g["lr"] = self.hp.get("lr_stage1_ft", self.hp["lr_stage1"])
+            _run_epochs(n_epochs)
+
+        elif self.training_mode == "sequential":
+            # ---------- Stage-1 with early-stopping ----------
+            print("[sequential] Stage-1 until early-stop")
+            self.forecaster.requires_grad_(False)
+
+            best_state_s = best_state_m = None
+            bad = 0
+            while ep < n_epochs:
+                _, l_s, l_m, l_pred = self._train_epoch(loader_train, opt_s, opt_m, opt_f)
+                val = float("nan")
+                if loader_valid is not None:
+                    val = self._eval(loader_valid)
+                    improve = val < best_val - 1e-4
+                    best_val = min(best_val, val)
+                    bad = 0 if improve else bad + 1
+                    if improve:
+                        best_state_s = {k: v.cpu() for k, v in self.stock_factor.state_dict().items()}
+                        best_state_m = {k: v.cpu() for k, v in self.market_factor.state_dict().items()}
+                    if bad >= self.patience:
+                        print(f"[sequential] early-stop after {bad} bad rounds")
+                        break
+
+                self._log_epoch(ep, l_s, l_m, l_pred, val_pred=val)
+                ep += 1
+
+            # restore best Stage-1 weights
+            if best_state_s:
+                self.stock_factor.load_state_dict(best_state_s)
+                self.market_factor.load_state_dict(best_state_m)
+
+            # ---------- Stage-2 only ----------
+            print(f"[sequential] Stage-2 fine-tune  ({n_epochs} epochs)")
+            self.stock_factor.requires_grad_(False)
+            self.market_factor.requires_grad_(False)
+            self.forecaster.requires_grad_(True)
+
+            # (re-)initialise optimiser for the head only
+            opt_f = torch.optim.AdamW(self.forecaster.parameters(),
+                                    lr=self.hp["lr_stage2"],
+                                    weight_decay=self.hp.get("weight_decay", 0))
+            _run_epochs(n_epochs)
+
+        else:   # "joint" (default behaviour)
+            _run_epochs(n_epochs)
+
         return best_val
-    
+ 
     def _train_epoch(self, loader, optim_s, optim_m, optim_f):
         self.stock_factor.train(); self.market_factor.train(); self.forecaster.train()
-        total = 0
-        for prices_seq, feat_seq, target, active_mask in loader:
-            prices_seq = prices_seq.to(self._device)
-            feat_seq   = feat_seq.to(self._device)
-            target     = target.to(self._device)
+        sum_pred = sum_s = sum_m = 0.0
+        n_batches = len(loader)
 
-            # Stage-1
-            u_seq, r_t, m_t, loss_s, loss_m = self._stage1_forward(prices_seq, feat_seq, active_mask)
-            # --- STOCK-level update --------------------------------------------
-            optim_s.zero_grad(set_to_none=True)
-            loss_s.backward()
-            optim_s.step()
+        for p_seq, f_seq, tgt, active_mask in loader:
+            p_seq, f_seq, tgt = p_seq.to(self._device), f_seq.to(self._device), tgt.to(self._device)
 
-            # --- MARKET-level update -------------------------------------------
-            optim_m.zero_grad(set_to_none=True)
-            loss_m.backward()                      # frees graph afterwards
-            optim_m.step()
+            # ───────── Stage-1  (parallel fwd + bwd) ────────────────
+            u_seq, r_t, m_t, loss_s, loss_m = self._stage1_forward(p_seq, f_seq, active_mask)
 
-            # Stage-2
-            preds, loss_pred, _ = self._stage2_forward(feat_seq, u_seq, r_t, m_t, target, active_mask)
-            optim_f.zero_grad(set_to_none=True)
-            loss_pred.backward()
-            optim_f.step()
+            if any(p.requires_grad for p in self.stock_factor.parameters()) \
+            or any(p.requires_grad for p in self.market_factor.parameters()):
 
-            total += loss_pred.item()
-        return total / len(loader)
+                optim_s.zero_grad(set_to_none=True)
+                optim_m.zero_grad(set_to_none=True)
 
-    # ───────────────────────────────────────────────────────────
-#   inside UMIModel
-# ───────────────────────────────────────────────────────────
+                if torch.cuda.is_available():
+                    stream_s, stream_m = torch.cuda.Stream(), torch.cuda.Stream()
+                    with torch.cuda.stream(stream_s):
+                        loss_s.backward(retain_graph=True)
+                    with torch.cuda.stream(stream_m):
+                        loss_m.backward()
+                    torch.cuda.synchronize()
+                else:                                  # CPU fallback
+                    loss_s.backward(retain_graph=True)
+                    loss_m.backward()
 
-def _train_hybrid(self, loader_tr, loader_val):
-    # 1) warm-up Stage-1 only
-    print(f"Hybrid-mode: pre-training Stage-1 for {self.pretrain_epochs} epochs")
-    self.forecaster.requires_grad_(False)
-    self._train(loader_tr, loader_val, self.pretrain_epochs)
+                optim_s.step(); optim_m.step()
 
-    # 2) unfreeze everything → joint optimisation
-    self.forecaster.requires_grad_(True)
-    print("Hybrid-mode: joint training (Stage-1 + Stage-2)")
-    return self._train(loader_tr, loader_val, self.n_epochs)
+            # ───────── Stage-2  (only if head is trainable) ─────────
+            if any(p.requires_grad for p in self.forecaster.parameters()):
+                preds, loss_pred, _ = self._stage2_forward(
+                    f_seq, u_seq, r_t, m_t, tgt, active_mask
+                )
+                optim_f.zero_grad(set_to_none=True)
+                loss_pred.backward()
+                optim_f.step()
+            else:
+                preds  = torch.zeros_like(tgt.squeeze(-1))
+                loss_pred = torch.tensor(0.0, device=self._device)
 
-def _train_sequential(self, loader_tr, loader_val):
-    # ---------- Stage-1 with early-stopping ----------
-    best = math.inf ; bad = 0
-    self.forecaster.requires_grad_(False)
-    val = self._train(loader_tr, loader_val, 1)
-    if val < best - 1e-4:
-        best, bad = val, 0
-        torch.save(self.stock_factor.state_dict(), "_tmp_stage1.pt")
-    else:
-        bad += 1
-    if bad >= patience: break
+            # ───────── bookkeeping ──────────────────────────────────
+            sum_pred += loss_pred.item()
+            sum_s    += loss_s.item()
+            sum_m    += loss_m.item()
 
-    # ---------- Stage-2 fine-tune ----------
-    self.stock_factor.load_state_dict(torch.load("_tmp_stage1.pt"))
-    self.stock_factor.requires_grad_(False)
-    self.forecaster.requires_grad_(True)
-    print(f"Sequential-mode: frozen Stage-1; training Stage-2 for {self.n_epochs} epochs")
-    return self._train_full(loader_tr, loader_val)
+        # averages for logging
+        return ( (sum_pred + sum_s + sum_m) / n_batches,
+                sum_s   / n_batches,
+                sum_m   / n_batches,
+                sum_pred / n_batches)
+
+
 
 
     # ---------------- stage1 / stage2 wrappers ----------------------- #
@@ -378,13 +509,15 @@ def _train_sequential(self, loader_tr, loader_val):
             torch.cuda.synchronize()         # wait for both streams
         else:
             # ---- CPU fallback: simple Python threads ----------------- #
-            def _run_stock(): return self.stock_factor(prices_seq, active_mask)
-            def _run_market(): return self.market_factor(feat_seq, stockIDs, active_mask)
+            def _run_stock(): 
+                return self.stock_factor(prices_seq, active_mask)
+            def _run_market(): 
+                return self.market_factor(feat_seq, stockIDs, active_mask)
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fu_s = pool.submit(_run_stock)
                 fu_m = pool.submit(_run_market)
-                u_seq, r_t, loss_s = fu_s.result()
-                m_t, loss_m = fu_m.result()
+                u_seq, loss_s, _ = fu_s.result()
+                r_t, m_t, loss_m, _ = fu_m.result()
 
         # ---- return results ---------------------------------------- #
         return u_seq, r_t, m_t, loss_s, loss_m
@@ -407,12 +540,12 @@ def _train_sequential(self, loader_tr, loader_val):
 
         # build loaders
         panel, active, idx = build_panel(data_dict, universe=self._universe)   # panel.shape: (T,I,F)
-        self.I_active = panel.size(1)              # real stocks today
+        self.I_active = panel.size(1)                 # real stocks today
         self.I = self.I_active * self.universe_mult   # padded size for dynamic universe
 
         # ───── pad zeros for inactive “slots” ─────
         pad = self.I - self.I_active
-        if pad:
+        if pad:  # always true
             zeros = torch.zeros(panel.size(0), pad, panel.size(2))
             panel = torch.cat([panel, zeros], dim=1)        # (T, I, F)
             active_pad  = torch.zeros(pad, active.size(1), dtype=torch.bool)
@@ -440,42 +573,46 @@ def _train_sequential(self, loader_tr, loader_val):
 
         # ------------------------- Optuna objective ----------------------------
         def objective(trial):
-            self.hp.update(_suggest_from_space(trial))
+            self.hp.update(self._suggest_from_space(trial))
             self._build_submodules()
-            return self._train(loader_train, loader_valid, n_epochs=1)  # single-epoch eval
+            val = self._train(loader_train, loader_valid, n_epochs=1)  # single-epoch eval
+            trial_log = self._model_dir / "hp_trials.csv"
+            pd.DataFrame([dict(trial=trial.number, loss_pred=val)]).to_csv(trial_log, mode="a", header=not trial_log.exists(), index=False)
+            return val
 
          # ------------------------- run tuning / skip ---------------------------
         if self.tune and not self._tuning_done:
-            db_url     = os.getenv("STORAGE_URL", DEFAULT_DB_URL)
-            study_name = os.getenv("STUDY_NAME", "umi_opt")
             storage = RDBStorage(              
-                db_url,
+                self.storage_url,
                 engine_kwargs={"connect_args": {"timeout": 30}, "pool_pre_ping": True}
                 )
 
-            study = optuna.create_study(study_name=study_name, storage=storage, direction="minimize", load_if_exists=True)
+            study = optuna.create_study(study_name=self.study_name, storage=storage, direction="minimize", load_if_exists=True)
             study.optimize(objective, n_trials=self.trials)
             self.hp.update(study.best_params)
             self._tuning_done = True
-            #if self._rank == 0:
             print("Best hyper-params:", study.best_params)
 
         # ------------------------- final training on train+valid------------------------------
         self._build_submodules()
         _ = self._train(loader_train, loader_valid=None, n_epochs=self.n_epochs)
 
-        # save
-        #if self._rank == 0:
+        # save the model and hyper-parameters
         timestamp = self._clock().strftime("%Y-%m-%dT%H-%M-%S")
         self._model_dir = Path(f"models/UMI/{self.freq}/{timestamp}")
         self._model_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), self._model_dir / "best.pt")
         with open(self._model_dir / "hparams.json", "w") as fp:
             json.dump(self.hp, fp, indent=2)
+        
+        # save training logs
+        pd.DataFrame(self._epoch_logs).to_csv(self._model_dir / "train_losses.csv",index=False)
+        self._dump_model_metadata() # save model metadata
+
         self._last_fit_time = self._clock()
 
     # ------------------------------------------------------------------ #
-    # update : decide if retrain_every elapsed → refit on latest data    #
+    # update : decide if retrain_delta elapsed → refit on latest data    #
     # ------------------------------------------------------------------ #
     def update(self, new_data_dict: Dict[str, "pd.DataFrame"]):
         if self._last_fit_time is None:
@@ -491,11 +628,9 @@ def _train_sequential(self, loader_tr, loader_val):
                 if len(self._universe) < self.I:        # capacity check
                     self._universe.append(k)            # reserve slot
                 else:
-                    # No free slots → double the universe size and retrain
-                    self.universe_mult *= 2               # grow factor 2×
                     self._universe.append(k)              # give the new stock a slot
-                    print(f"[info] universe full – capacity doubled to ×{self.universe_mult}. Retraining …")
-                    self.fit(new_data_dict)               # rebuild with larger I
+                    print(f"[info] universe full. Retraining …")
+                    self.fit(new_data_dict)               # rebuild with larger I. fit will expand the universe
                     return                                # early exit; retrain done
 
         _, active, _ = build_panel(new_data_dict, universe=self._universe)
@@ -509,7 +644,8 @@ def _train_sequential(self, loader_tr, loader_val):
         just_delisted = (was_live & (~new_mask)).any().item()   # True if at least one stock has disappeared since the last update, False otherwise.
 
         # always store most-recent mask for later calls
-        self._active_mask = new_mask
+        with torch.no_grad():
+            self._active_mask.copy_(new_mask)
 
         # ---------- decide whether to retrain -------------------------
         time_elapsed = now - self._last_fit_time >= self.retrain_delta
@@ -522,19 +658,26 @@ def _train_sequential(self, loader_tr, loader_val):
     # predict : one inference step                                       #
     # ------------------------------------------------------------------ #
     def predict(self, data_dict: Dict[str, "pd.DataFrame"]) -> Dict[str, float]:
-        panel, active, idx = build_panel(data_dict)   # (T,I_active,F) , (I_active,T)
+        panel, active, idx = build_panel(data_dict, self._universe)   # (T,I_active,F) , (I_active,T)
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
 
-        prices_seq = panel[-self.L-1:, :, 0]                 # (L+1,I)
+        prices_seq = panel[-self.L-1:, :, self.close_idx]    # (L+1,I)
         feat_seq   = panel[-self.L-1:]                       # (L+1,I,F)
         prices_seq = prices_seq.to(self._device)
         feat_seq   = feat_seq.to(self._device)
 
         # ---- build 1-D mask for the *current* bar (t = L) -------------
-        active_mask = active[:, -1]                          # (I_active)
+        active_mask = active[:, -1]                          # (I_active) at last time step
         pad = self.I - active_mask.size(0)
-        if pad:                                              # keep same length as in training
+        if pad>=0:                                              # keep same length as in training
             active_mask = torch.cat([active_mask, torch.zeros(pad, dtype=torch.bool)])
+        else:
+            print("[warn] universe overflow – growing capacity and retraining once.")
+            # 2) full re-fit on the larger I
+            self.fit(data_dict)
+            # 3) recurse – now pad will be ≥ 0
+            return self.predict(data_dict)
+
         active_mask = active_mask.to(self._device).unsqueeze(0)  # → (1, I)
 
         with torch.no_grad():
@@ -578,8 +721,11 @@ if __name__ == "__main__":
                     help="dict-of-dataframes serialized via DataFrame.to_json")
     ap.add_argument("--freq", default="1d", help="frequency of the data, e.g. 1d, 15m, 1h")
     ap.add_argument("--window-len",  type=int, default=60)
-    ap.add_argument("--pred-len",    type=int, default=1)
-    ap.add_argument("--training-mode", choices=["hybrid","sequential"],default="hybrid")
+    ap.add_argument("--pred-len",    type=int, default=1, help="horizon in *bars*, e.g. 4 → predict 4 steps ahead")
+    ap.add_argument("--dynamic-universe-mult", type=int, default=2, help="over-allocation factor for dynamic universe")   
+    ap.add_argument("--training-mode", choices=["hybrid","sequential"], default="sequential",
+                    help="hybrid: stage-1 pre-training, then joint training; sequential: stage-1 first, then stage-2")
+    ap.add_argument("--retrain-delta", default="30", help="time delta for retraining, e.g. 30d, 1w, 1h")
     ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
     ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
     ap.add_argument("--end-train",   default="2019-12-31")
@@ -587,11 +733,14 @@ if __name__ == "__main__":
     ap.add_argument("--end-test",    default=None, help="optional end date for test set")
     ap.add_argument("--study-name",  default=os.getenv("STUDY_NAME", "umi"))
     ap.add_argument("--storage-url", default=os.getenv("STORAGE_URL", "sqlite:///umi_hp_optim.db"))
-    ap.add_argument("--n-epochs",    type=int, default=20)
+    ap.add_argument("--n-epochs",    type=int, default=30)
     ap.add_argument("--batch-size",    type=int, default=64)
     ap.add_argument("--tune-hparams", type=bool, default=False)
-    ap.add_argument("--tune-trials", type=int, default=50)
-    ap.add_argument("--retrain-every", default="30d")
+    ap.add_argument("--tune-trials", type=int, default=20)
+    ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
+    ap.add_argument("storage_url", type=str, default="sqlite:///models/UMI/umi_hp_optimization.db",
+                    help="URL for Optuna storage ")
+    ap.add_argument("--model-dir", type=str, default="models/UMI", help="directory where the model is saved")
 
     
     args = ap.parse_args()
@@ -614,10 +763,16 @@ if __name__ == "__main__":
         tune_hparams=True,          # first run tunes
         n_epochs=args.n_epochs,     # then trains for n_epochs
         batch_size=args.batch_size,
-        retrain_every=args.retrain_every,
+        retrain_delta=pd.DateOffset(days=int(args.retrain_delta)),
         dynamic_universe_mult=2,    # 2x over-allocation for dynamic universe
         tune_trials=0,              # number controlled per-job via TRIALS_PER_JOB env
         study_name=args.study_name,
+        storage_url=args.storage_url,
+        training_mode=args.training_mode,
+        pretrain_epochs=args.pretrain_epochs,
+        patience=args.patience,
+        close_idx=args.close_idx,
+        model_dir=args.model_dir,
         storage_url=args.storage_url,
     )
 
