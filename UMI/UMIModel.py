@@ -7,8 +7,8 @@
 # • Relies on the low-level blocks already defined earlier in main.py
 #   (StockLevelFactorLearning, MarketLevelFactorLearning, ForecastingLearning)
 # • Uses PyTorch DistributedDataParallel (DDP) if torch.distributed has been
-#   initialised by `torchrun` / `mpirun … python -m torch.distributed.run …`.
-# • Optional Optuna hyper-parameter tuning when `tune_hparams=True`.
+#   initialised by torchrun / mpirun … python -m torch.distributed.run ….
+# • Optional Optuna hyper-parameter tuning when tune_hparams=True.
 #
 ###############################################################################
 
@@ -166,6 +166,11 @@ class UMIModel(nn.Module):
         tune_trials: int = 20,
         n_epochs: int = 20,
         batch_size: int = 64,
+        training_mode: str="hybrid",    # hybrid/sequential:
+                                        # hybrid -> stage1 factors for few epochs, then stage2 altogether
+                                        # sequential -> stage1 first until early stopping, then stage2
+        pretrain_epochs:int=5,
+        patience:int=10,     # early stopping patience epochs for any training stage
         **hparams,
     ):
         self.freq           = freq
@@ -182,6 +187,9 @@ class UMIModel(nn.Module):
         self.n_epochs       = n_epochs
         self.batch_size     = batch_size
         self.hp             = self._default_hparams()
+        self.training_mode = training_mode
+        self.pretrain_epochs = pretrain_epochs
+        self.patience = patience
         self.hp.update(hparams)
         self._tuning_done = False   # flag to avoid re-tuning of hyper-params
         self._clock: Callable[[], "pd.Timestamp"] = clock_fn or pd.Timestamp.utcnow
@@ -208,13 +216,13 @@ class UMIModel(nn.Module):
     @staticmethod
     def _suggest_from_space(trial: "optuna.Trial") -> dict[str, float]:
     """Utility used by *every* Optuna call so the space is defined once."""
-    hp = {}
-    for k, rng in HP_SEARCH_SPACE.items():
-        if isinstance(rng[0], str) and rng[0] == "log":
-            hp[k] = trial.suggest_float(k, rng[1], rng[2], log=True)
-        else:
-            hp[k] = trial.suggest_float(k, rng[0], rng[1])
-    return hp
+        hp = {}
+        for k, rng in HP_SEARCH_SPACE.items():
+            if isinstance(rng[0], str) and rng[0] == "log":
+                hp[k] = trial.suggest_float(k, rng[1], rng[2], log=True)
+            else:
+                hp[k] = trial.suggest_float(k, rng[0], rng[1])
+        return hp
 
     # ---------------- sub-module builder ----------------------------- #
     def _build_submodules(self):
@@ -291,7 +299,6 @@ class UMIModel(nn.Module):
                 print(f"epoch {ep:>3} | train loss {trn:8.5f} | valid loss {val:8.5f} | best valid {best_val:8.5f}")
         return best_val
     
-    
     def _train_epoch(self, loader, optim_s, optim_m, optim_f):
         self.stock_factor.train(); self.market_factor.train(); self.forecaster.train()
         total = 0
@@ -320,6 +327,41 @@ class UMIModel(nn.Module):
 
             total += loss_pred.item()
         return total / len(loader)
+
+    # ───────────────────────────────────────────────────────────
+#   inside UMIModel
+# ───────────────────────────────────────────────────────────
+
+def _train_hybrid(self, loader_tr, loader_val):
+    # 1) warm-up Stage-1 only
+    print(f"Hybrid-mode: pre-training Stage-1 for {self.pretrain_epochs} epochs")
+    self.forecaster.requires_grad_(False)
+    self._train(loader_tr, loader_val, self.pretrain_epochs)
+
+    # 2) unfreeze everything → joint optimisation
+    self.forecaster.requires_grad_(True)
+    print("Hybrid-mode: joint training (Stage-1 + Stage-2)")
+    return self._train(loader_tr, loader_val, self.n_epochs)
+
+def _train_sequential(self, loader_tr, loader_val):
+    # ---------- Stage-1 with early-stopping ----------
+    best = math.inf ; bad = 0
+    self.forecaster.requires_grad_(False)
+    val = self._train(loader_tr, loader_val, 1)
+    if val < best - 1e-4:
+        best, bad = val, 0
+        torch.save(self.stock_factor.state_dict(), "_tmp_stage1.pt")
+    else:
+        bad += 1
+    if bad >= patience: break
+
+    # ---------- Stage-2 fine-tune ----------
+    self.stock_factor.load_state_dict(torch.load("_tmp_stage1.pt"))
+    self.stock_factor.requires_grad_(False)
+    self.forecaster.requires_grad_(True)
+    print(f"Sequential-mode: frozen Stage-1; training Stage-2 for {self.n_epochs} epochs")
+    return self._train_full(loader_tr, loader_val)
+
 
     # ---------------- stage1 / stage2 wrappers ----------------------- #
     def _stage1_forward(self, prices_seq, feat_seq, active_mask):
@@ -534,11 +576,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-json",   default="data/ohlcv_plus_indicators.json",
                     help="dict-of-dataframes serialized via DataFrame.to_json")
-    ap.add_argument("--freq",        default="1d")
+    ap.add_argument("--freq", default="1d", help="frequency of the data, e.g. 1d, 15m, 1h")
     ap.add_argument("--window-len",  type=int, default=60)
     ap.add_argument("--pred-len",    type=int, default=1)
+    ap.add_argument("--training-mode", choices=["hybrid","sequential"],default="hybrid")
+    ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
+    ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
     ap.add_argument("--end-train",   default="2019-12-31")
     ap.add_argument("--end-valid",   default="2020-12-31")
+    ap.add_argument("--end-test",    default=None, help="optional end date for test set")
     ap.add_argument("--study-name",  default=os.getenv("STUDY_NAME", "umi"))
     ap.add_argument("--storage-url", default=os.getenv("STORAGE_URL", "sqlite:///umi_hp_optim.db"))
     ap.add_argument("--n-epochs",    type=int, default=20)
@@ -546,7 +592,7 @@ if __name__ == "__main__":
     ap.add_argument("--tune-hparams", type=bool, default=False)
     ap.add_argument("--tune-trials", type=int, default=50)
     ap.add_argument("--retrain-every", default="30d")
-    ap.add_argument("--end-test",    default=None, help="optional end date for test set")
+
     
     args = ap.parse_args()
 
