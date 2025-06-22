@@ -778,7 +778,7 @@ if __name__ == "__main__":
     ap.add_argument("--tune-hparams", action="store_false")
     ap.add_argument("--tune-trials", type=int, default=20)
     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
-    ap.add_argument("storage_url", type=str, default=f"sqlite:///{DEFAULT_MODELDR}/umi_hp_optimization.db", help="URL for Optuna storage ")
+    ap.add_argument("--storage_url", type=str, default=f"sqlite:///{DEFAULT_MODELDR}/umi_hp_optimization.db", help="URL for Optuna storage ")
     ap.add_argument("--model-dir", type=str, default=DEFAULT_MODELDR, help="directory where the model is saved")
 
 
