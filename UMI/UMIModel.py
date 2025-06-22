@@ -846,7 +846,7 @@ if __name__ == "__main__":
     print("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
 
     try:
-    model.fit(data_dict)  
+        model.fit(data_dict)  
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print("[warn] OOM – retrying with dynamic_universe_mult = 1")
