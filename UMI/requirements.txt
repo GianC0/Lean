@@ -1,0 +1,4 @@
+SQLAlchemy==2.0.40
+optuna
+pandas==2.2.3
+torch==2.6.0

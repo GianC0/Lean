@@ -758,7 +758,7 @@ if __name__ == "__main__":
 
     import argparse, json, pandas as pd, os
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir",   default=DEFAULT_DATADIR, help="directory with OHLCV data in format \{TICKER\}.csv")
+    ap.add_argument("--data-dir",   default=DEFAULT_DATADIR, help=f"directory with OHLCV data in format {TICKER}.csv")
     ap.add_argument("--freq", default="1B", help="frequency of the data e.g. 1D, 15m, 1h. B means 1 business day")
     ap.add_argument("--window-len",  type=int, default=60)
     ap.add_argument("--pred-len",    type=int, default=1, help="horizon in *bars*, e.g. 4 → predict 4 steps ahead")
@@ -850,8 +850,7 @@ if __name__ == "__main__":
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print("[warn] OOM – retrying with dynamic_universe_mult = 1")
-            model = UMIModel(..., dynamic_universe_mult=1, tune_hparams=False, ...)
-            model.fit(data_dict)
+            raise
         else:
             raise
       
