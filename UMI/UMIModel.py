@@ -708,15 +708,58 @@ class UMIModel(nn.Module):
         self.forecaster.load_state_dict(sd["forecaster"])
         assert self.I == sd["I"] and self.F == sd["F"]
 
+
+# ---------------------------------- #
+#  Backtest helpers                  #
+# ---------------------------------- #
+
+### not expected to be used within optuna,  but just for test.
+class SimClock:
+    """
+    Mutable closure so the model can always ask
+    “what time is it *right now*?”
+    """
+    def __init__(self, now: pd.Timestamp):
+        self._now = now
+
+    def tick(self, new_now: pd.Timestamp):
+        self._now = new_now
+
+    # the model calls this
+    def __call__(self) -> pd.Timestamp:
+        return self._now
+
+def cut_off(data_dict: dict[str, pd.DataFrame],
+            now: pd.Timestamp,
+            lookback: int | None = None) -> dict[str, pd.DataFrame]:
+    """
+    Returns a *new* dict whose frames are truncated at `now`.
+    If `lookback` is supplied, keep only the last `lookback` bars
+    to save RAM / speed-up build_panel.
+    """
+    out = {}
+    for k, df in data_dict.items():
+        df_trunc = df.loc[:now]
+        if lookback is not None:
+            df_trunc = df_trunc.iloc[-lookback:]
+        out[k] = df_trunc
+    return out
+
+
+
 # ------------------------------------------------------------------ #
 #  Main guard: lets the file act as CLI for SLURM array jobs         #
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
+
+    BASE_DIR        = Path(__file__).resolve().parent
+    DEFAULT_DATADIR = BASE_DIR / "data"
+    DEFAULT_MODELDR = BASE_DIR / "models" / "UMI"          #   umi/models/UMI
+
     import argparse, json, pandas as pd, os
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir",   default="stocks/all", help="directory with OHLCV data in format \{TICKER\}.csv")
-                    help="dict-of-dataframes serialized via DataFrame.to_json")
-    ap.add_argument("--freq", default="1d", help="frequency of the data, e.g. 1d, 15m, 1h")
+    ap.add_argument("--data-dir",   default=DEFAULT_DATADIR, help="directory with OHLCV data in format \{TICKER\}.csv")
+    ap.add_argument("--freq", default="1B", help="frequency of the data e.g. 1D, 15m, 1h. B means 1 business day")
     ap.add_argument("--window-len",  type=int, default=60)
     ap.add_argument("--pred-len",    type=int, default=1, help="horizon in *bars*, e.g. 4 → predict 4 steps ahead")
     ap.add_argument("--dynamic-universe-mult", type=int, default=2, help="over-allocation factor for dynamic universe")   
@@ -725,6 +768,7 @@ if __name__ == "__main__":
     ap.add_argument("--retrain-delta", type=int, default=30, help="delta bars (time units) for retraining, e.g. 30, 300 minutes or days")
     ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
     ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
+    ap.add_argument("--start-train", default="2021-01-01", help="start date for back-test")
     ap.add_argument("--end-train",   default="2019-12-31")
     ap.add_argument("--end-valid",   default="2020-12-31")
     ap.add_argument("--end-test",    default=None, help="optional end date for test set")
@@ -734,9 +778,9 @@ if __name__ == "__main__":
     ap.add_argument("--tune-hparams", action="store_false")
     ap.add_argument("--tune-trials", type=int, default=20)
     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
-    ap.add_argument("storage_url", type=str, default="sqlite:///models/UMI/umi_hp_optimization.db",
-                    help="URL for Optuna storage ")
-    ap.add_argument("--model-dir", type=str, default="models/UMI", help="directory where the model is saved")
+    ap.add_argument("storage_url", type=str, default=f"sqlite:///{DEFAULT_MODELDR}/umi_hp_optimization.db", help="URL for Optuna storage ")
+    ap.add_argument("--model-dir", type=str, default=DEFAULT_MODELDR, help="directory where the model is saved")
+
 
     
     args = ap.parse_args()
@@ -769,6 +813,9 @@ if __name__ == "__main__":
     else:
         raise ValueError("No data directory provided. Use --data-dir to specify the path to the data.")
 
+    
+    clock = SimClock(pd.Timestamp(args.end_valid, tz="UTC"))
+
     # ---------- build & fit -----------------------------------------
     # Each SLURM array task sees exactly one GPU thanks to CUDA_VISIBLE_DEVICES
     model = UMIModel(
@@ -778,7 +825,6 @@ if __name__ == "__main__":
         pred_len=args.pred_len,
         end_train=args.end_train,
         end_valid=args.end_valid,
-        end_test=args.end_test,
         tune_hparams=args.tune_hparams,          # first run tunes
         n_epochs=args.n_epochs,     # then trains for n_epochs
         batch_size=args.batch_size,
@@ -792,9 +838,106 @@ if __name__ == "__main__":
         patience=args.patience,
         close_idx=( args.close_idx if args.close_idx is not None else list(next(iter(data_dict.values())).columns).index("Close")),
         model_dir=args.model_dir,
-        data_dir= 
+        data_dir= "",
+        clock_fn=clock,              # pass the clock closure
     )
 
     print(next(iter(data_dict.items()))[1].head())
     print("Detected close_idx =", list(next(iter(data_dict.values())).columns).index("Close"))
-    model.fit(data_dict)            # Optuna tuning occurs only once per study
+
+    try:
+    model.fit(data_dict)  
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print("[warn] OOM – retrying with dynamic_universe_mult = 1")
+            model = UMIModel(..., dynamic_universe_mult=1, tune_hparams=False, ...)
+            model.fit(data_dict)
+        else:
+            raise
+      
+
+    assert model._last_fit_time is not None   # sanity check
+
+        # -------------- WALK-FORWARD BACK-TEST --------------------------
+    bt_start = pd.Timestamp(args.start_train, tz="UTC")
+    bt_end   = (pd.Timestamp(args.test_end, tz="UTC")
+                if args.bt_end else max(df.index.max() for df in data_dict.values()))
+
+    # initialise clock *on* bt_start − 1 bar
+    clock = SimClock(bt_start - pd.Timedelta(model.freq))
+    model._clock = clock   # hand the mutable clock to the already-fitted model
+
+    preds, targets = [], []
+    dates = pd.date_range(bt_start, bt_end, freq="B")  # business days only
+
+    pred_rows, truth_rows = [], []
+
+
+    for t in dates:
+        # advance the clock first
+        clock.tick(t)
+
+        # slice up-to-now (keep only last L+1 bars – faster)
+        now_dict = cut_off(data_dict, t, lookback=model.L + model.pred_len + 1)
+
+        # === prediction ===
+        y_hat = model.predict(now_dict)
+
+
+        step   = pd.tseries.frequencies.to_offset(model.freq) * model.pred_len
+        t_next = t + step                       # first bar the forecast refers to
+
+        # 1) close[t]  —— last price we *know* at time t
+        close_now = {k: df.loc[t, "Close"] for k, df in now_dict.items()}
+
+        # 2) close[t_next] —— realise it only if it already exists in the file
+        if all(t_next in df.index for df in data_dict.values()):
+            close_next = {k: df.loc[t_next, "Close"] for k, df in data_dict.items()}
+
+            # ----- SERIES we will store -----------------------------------
+            truth_close_ser = pd.Series(close_next, name=t)            # real future close
+            truth_ret_ser   = ((truth_close_ser - pd.Series(close_now)) /                 # realised return
+                            pd.Series(close_now)).rename(t)
+
+            # optional: convert model's return prediction into a
+            # predicted close so the notebook can plot both on the same axis
+            pred_close_ser = (1.0 + pd.Series(y_hat)) * pd.Series(close_now)
+            pred_close_ser.name = t
+
+            # ----- book-keeping -------------------------------------------
+            pred_rows.append(pred_close_ser)
+            truth_rows.append(truth_close_ser)
+
+        else:
+            # Horizon exceeds file – stop the back-test here
+            break
+
+        pred_ser = pd.Series(y_hat, name=t)  # pd.Series of predictions, index = tickers
+        preds.append(pred_ser)  # pd.Series of predictions, index = tickers)
+
+
+        # ground truth: next-bar return that the model tries to predict
+        if t + pd.tseries.frequencies.to_offset(model.freq) in now_dict[next(iter(now_dict))].index:
+            tgt_dict = cut_off(data_dict, t + pd.tseries.frequencies.to_offset(model.freq), lookback=1)
+            close_now  = {k: df.loc[t, "Close"]   for k, df in now_dict.items()}
+            close_next = {k: df.iloc[-1]["Close"] for k, df in tgt_dict.items()}
+            rtn = {k: (close_next[k] - close_now[k]) / close_now[k] for k in close_now}
+            targets.append(pd.Series(rtn, name=t))
+
+        # === optional retrain === (maintains correct chronology)
+        model.update(now_dict)
+
+    # concatenate & evaluate
+    pred_df  = pd.concat(pred_rows,  axis=1).T   # predicted closes
+    truth_df = pd.concat(truth_rows, axis=1).T   # realised closes
+
+    out_dir = Path(args.model_dir)
+    pred_df.to_csv(out_dir / "bt_pred_close.csv")
+    truth_df.to_csv(out_dir / "bt_truth_close.csv")
+
+    if args.bt_metric == "mse":
+        mse = ((pred_df - target_df) ** 2).mean().mean()
+        print(f"Back-test MSE = {mse:.6f}")
+    elif args.bt_metric == "ic":
+        ic = pred_df.corrwith(target_df, axis=1).mean()
+        print(f"Average Information Coefficient = {ic:.4f}")
