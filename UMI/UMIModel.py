@@ -125,7 +125,7 @@ def build_panel(data_dict: Dict[str, "pd.DataFrame"],
 
     T, F, I = len(df_pivot), len(feature_cols), len(keys)
     values = torch.tensor(df_pivot.values, dtype=torch.float32)
-    tensor = values.reshape(T, F, I).transpose(0,2,1) # (T,I,F)
+    tensor = values.reshape(T, F, I).permute(0,2,1) # (T,I,F)
     active = torch.isfinite(tensor).all(-1).transpose(0,1) # (I,T)
 
     return tensor, active, df_pivot.index       
