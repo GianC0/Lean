@@ -1,5 +1,5 @@
 """
-Module definitions for the UMI (Unified Market Intelligence) framework.
+Module definitions for the UMI.
 This module contains implementations for:
 1. Supervised InfoNCE loss
 2. Stock-level factor learning
@@ -137,7 +137,7 @@ class MarketLevelFactorLearning(nn.Module):
     @staticmethod
     def _weighted_mean(eta: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """Eq. 19   η-weighted market vector."""
-        return torch.einsum("bi,bid->bd", eta, r) / (eta.sum(1) + 1e-6)
+        return torch.einsum("bi,bid->bd", eta, r) / (eta.sum(1, keepdim=True) + 1e-6)
 
     def _compute_m_t(
         self,
@@ -151,6 +151,7 @@ class MarketLevelFactorLearning(nn.Module):
             m_t : (B,2F)     — market vector
             """
             B, Lτ, I, f = e_window.shape
+            
 
             if active_mask is not None:
                 # zero out dead columns before any linear or attention op
@@ -168,6 +169,7 @@ class MarketLevelFactorLearning(nn.Module):
 
             eta_in = self.W_iota(stockID_b) + r_t                    # (B,I,2F)
             eta    = F.relu(torch.einsum("bid,d->bi", eta_in, self.w_eta))
+
             m_t    = self._weighted_mean(eta, r_t)                 # (B,2F)
             return r_t, m_t, eta
 
@@ -185,8 +187,8 @@ class MarketLevelFactorLearning(nn.Module):
             loss_total
             log-dict
         """
-        B, T, I, F = e_seq.shape
-        assert I == self.I and F == self.F
+        B, T, I, f = e_seq.shape
+        assert I == self.I and f == self.F
 
         # expand stockID to batch
         stockID_b = stockID.unsqueeze(0).expand(B, -1, -1)      # (B,I,I)
@@ -286,7 +288,7 @@ class ForecastingLearning(nn.Module):
         nhead = max(1, min(max_heads, self.D_enc // head_dim_target))
         while self.D_enc % nhead != 0 and nhead > 1:   # make it divide cleanly
             nhead -= 1
-        self.nhead = nhead
+        self.nheads = nhead
 
         # ───── Transformer encoder over g_t = [e_t ∥ u_t]  (Eq. 25) ───── #
         self.pos_enc = PositionalEncoding(self.D_enc)

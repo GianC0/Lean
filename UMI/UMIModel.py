@@ -168,14 +168,16 @@ class UMIModel(nn.Module):
         **hparams,
     ):
 
+        super().__init__()
+
         # time parameters
-        self.freq           = freq                                               # e.g. "1d", "15m", "1h"
-        self.pred_len    = pred_len                                              # number of bars to predict
-        self.retrain_delta  = retrain_delta                                      # time delta for retraining 
-        self.end_train      = pd.Timestamp(end_train)                            # end of training date
-        self.end_valid      = pd.Timestamp(end_valid)                            # end of validation date
-        self.end_test       = pd.Timestamp(end_test)  if end_test else None      # end of test date (optional)
-        self._last_fit_time = None                                               # last time fit() was called
+        self.freq           = freq                                                           # e.g. "1d", "15m", "1h"
+        self.pred_len    = pred_len                                                          # number of bars to predict
+        self.retrain_delta  = retrain_delta                                                  # time delta for retraining 
+        self.end_train      = pd.to_datetime(end_train, utc=True)                            # end of training date
+        self.end_valid      = pd.to_datetime(end_valid, utc=True)                            # end of validation date
+        self.end_test       = pd.to_datetime(end_test,  utc=True) if end_test else None      # end of test date (optional)
+        self._last_fit_time = None                                                           # last time fit() was called
         
 
         # model parameters
@@ -769,13 +771,13 @@ if __name__ == "__main__":
     ap.add_argument("--pretrain-epochs", type=int, default=5, help="Stage-1 epochs before joint training (hybrid)")
     ap.add_argument("--patience",    type=int, default=10, help="Early stopping patience epochs for any training stage")
     ap.add_argument("--start-train", default="2018-01-01", help="start date for back-test")
-    ap.add_argument("--end-train",   default="2019-12-31")
-    ap.add_argument("--end-valid",   default="2020-12-31")
-    ap.add_argument("--end-test",    default="2021-12-31", help="optional end date for test set")
+    ap.add_argument("--end-train",   default="2018-02-28")
+    ap.add_argument("--end-valid",   default="2018-04-30")
+    ap.add_argument("--end-test",    default="2018-04-30", help="optional end date for test set")
     ap.add_argument("--study-name",  default=os.getenv("STUDY_NAME", "umi"))
-    ap.add_argument("--n-epochs",    type=int, default=30)
-    ap.add_argument("--batch-size",    type=int, default=64)
-    ap.add_argument("--tune-hparams", action="store_false")
+    ap.add_argument("--n-epochs",    type=int, default=1)
+    ap.add_argument("--batch-size",    type=int, default=128)
+    ap.add_argument("--tune-hparams", action="store_false", default=False)
     ap.add_argument("--tune-trials", type=int, default=20)
     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
     ap.add_argument("--storage_url", type=str, default=f"sqlite:///{DEFAULT_MODELDR}/umi_hp_optimization.db", help="URL for Optuna storage ")
@@ -935,8 +937,8 @@ if __name__ == "__main__":
     truth_df.to_csv(out_dir / "bt_truth_close.csv")
 
     if args.bt_metric == "mse":
-        mse = ((pred_df - target_df) ** 2).mean().mean()
+        mse = ((pred_df - truth_df) ** 2).mean().mean()
         print(f"Back-test MSE = {mse:.6f}")
     elif args.bt_metric == "ic":
-        ic = pred_df.corrwith(target_df, axis=1).mean()
+        ic = pred_df.corrwith(truth_df, axis=1).mean()
         print(f"Average Information Coefficient = {ic:.4f}")
