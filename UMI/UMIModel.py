@@ -217,7 +217,7 @@ class UMIModel(nn.Module):
             lambda_sync   = 1.0,  # official UMI paper value
             lambda_rankic = 0.1,  # official UMI paper value
             temperature   = 0.07,
-            sync_thr      = 0.6,
+            sync_thr      = 0.6,   # official UMI paper value
             lr            = 1e-3,
             weight_decay  = 0.0,
             lr_stage1      = 1e-3,
@@ -401,7 +401,7 @@ class UMIModel(nn.Module):
                 val = float("nan")
                 if loader_valid is not None:
                     val = self._eval(loader_valid)
-                    improve = val < best_val - 1e-4
+                    improve = val < best_val * 0.995
                     best_val = min(best_val, val)
                     bad = 0 if improve else bad + 1
                     if improve:
@@ -459,7 +459,6 @@ class UMIModel(nn.Module):
                         loss_s.backward(retain_graph=True)
                     with torch.cuda.stream(stream_m):
                         loss_m.backward()
-                    torch.cuda.synchronize()
                 else:                                  # CPU fallback
                     loss_s.backward(retain_graph=True)
                     loss_m.backward()
@@ -504,7 +503,7 @@ class UMIModel(nn.Module):
                 u_seq, loss_s, _ = self.stock_factor(prices_seq, active_mask)  
             with torch.cuda.stream(stream_m):
                 r_t, m_t, loss_m, _ = self.market_factor(feat_seq, stockIDs, active_mask)
-            torch.cuda.synchronize()         # wait for both streams
+            
         else:
             # ---- CPU fallback: simple Python threads ----------------- #
             def _run_stock(): 
@@ -556,24 +555,23 @@ class UMIModel(nn.Module):
 
         train_mask = idx <= self.end_train
         valid_mask = (idx > self.end_train) & (idx <= self.end_valid)
+        test_mask  = (idx > self.end_valid) & (self.end_test is not None) & (idx <= self.end_test)
 
-        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask] , self.L, self.pred_len, close_idx=3)
-        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=3)
+        ds_train = SlidingWindowDataset(panel[train_mask], active[:, train_mask], self.L, self.pred_len, close_idx=self.close_idx)
+        ds_valid = SlidingWindowDataset(panel[valid_mask], active[:, valid_mask] ,self.L, self.pred_len, close_idx=self.close_idx)
 
         train_sampler = (
             torch.utils.data.distributed.DistributedSampler(ds_train)
             if dist.is_initialized() else None
         )
-        loader_train = DataLoader(
-            ds_train, batch_size=self.batch_size, sampler=train_sampler, shuffle=train_sampler is None
-        )
-        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size)
+        loader_train = DataLoader(ds_train, batch_size=self.batch_size, sampler=None, shuffle=True)
+        loader_valid = DataLoader(ds_valid, batch_size=self.batch_size, sampler=None, shuffle=True)
 
         # ------------------------- Optuna objective ----------------------------
         def objective(trial):
             self.hp.update(self._suggest_from_space(trial))
             self._build_submodules()
-            val = self._train(loader_train, loader_valid, n_epochs=5)  # 5-epoch eval
+            val = self._train(loader_train, loader_valid, n_epochs=15)  # 5-epoch eval
             trial_log = self._model_dir / "hp_trials.csv"
             pd.DataFrame([dict(trial=trial.number, loss_pred=val)]).to_csv(trial_log, mode="a", header=not trial_log.exists(), index=False)
             return val
@@ -593,7 +591,7 @@ class UMIModel(nn.Module):
 
         # ------------------------- final training on train+valid------------------------------
         self._build_submodules()
-        _ = self._train(loader_train, loader_valid=None, n_epochs=self.n_epochs)
+        _ = self._train(loader_train, loader_valid, n_epochs=self.n_epochs)
 
         # save the model and hyper-parameters
         timestamp = self._clock().strftime("%Y-%m-%dT%H-%M-%S")
@@ -633,8 +631,14 @@ class UMIModel(nn.Module):
                     self.fit(new_data_dict)               # rebuild with larger I. fit will expand the universe
                     return                                # early exit; retrain done
 
-        _, active, _ = build_panel(new_data_dict, universe=self._universe)
+        _, active, idx = build_panel(new_data_dict, universe=self._universe)
         new_mask = active[:, -1]                       # (I_active_now) mask for stocks that are live NOW
+        latest = idx[-1]
+        if self.end_test is not None::
++            self.end_valid = min(latest, self.end_test)
+        else:
+            self.end_valid = latest
+            self.end_train = self.end_valid - pd.DateOffset(months=6)
         pad = self.I - new_mask.size(0)
         if pad:
             new_mask = torch.cat([new_mask, torch.zeros(pad, dtype=torch.bool)])
@@ -657,7 +661,7 @@ class UMIModel(nn.Module):
     # ------------------------------------------------------------------ #
     # predict : one inference step                                       #
     # ------------------------------------------------------------------ #
-    def predict(self, data_dict: Dict[str, "pd.DataFrame"]) -> Dict[str, float]:
+    def predict(self, data_dict: Dict[str, "pd.DataFrame"],  _retry: bool = False) -> Dict[str, float]:
         panel, active, idx = build_panel(data_dict, universe=self._universe)   # (T,I_active,F) , (I_active,T)
         assert panel.size(0) >= self.L + 1, "need L+1 bars for inference"
 
@@ -672,17 +676,20 @@ class UMIModel(nn.Module):
         if pad>=0:                                              # keep same length as in training
             active_mask = torch.cat([active_mask, torch.zeros(pad, dtype=torch.bool)])
         else:
+            if _retry:
+                raise RuntimeError("Universe capacity still insufficient after one retrain.")
             print("[warn] universe overflow – growing capacity and retraining once.")
             # 2) full re-fit on the larger I
             self.fit(data_dict)
             # 3) recurse – now pad will be ≥ 0
-            return self.predict(data_dict)
+            return self.predict(data_dict, _retry=True)
 
         active_mask = active_mask.to(self._device).unsqueeze(0)  # → (1, I)
 
         with torch.no_grad():
             u_seq, r_t, m_t, _ , _ = self._stage1_forward(prices_seq.unsqueeze(0), feat_seq.unsqueeze(0), active_mask=active_mask )
             preds, _, _ = self._stage2_forward(feat_seq.unsqueeze(0), u_seq, r_t, m_t, target=None, active_mask=active_mask)
+            preds = preds[:, :self.I_active]
         # return as dict {stock: prediction}
         keys = sorted(data_dict.keys())
         return {k: float(preds[0, i].cpu()) for i, k in enumerate(keys)}
@@ -778,7 +785,7 @@ if __name__ == "__main__":
     ap.add_argument("--n-epochs",    type=int, default=1)
     ap.add_argument("--batch-size",    type=int, default=128)
     ap.add_argument("--tune-hparams", action="store_false", default=False)
-    ap.add_argument("--tune-trials", type=int, default=20)
+    ap.add_argument("--n-trials", type=int, default=20)
     ap.add_argument("--close-idx", type=int, default=3, help="index of the 'close' column in the dataframes (default: 3)")
     ap.add_argument("--storage_url", type=str, default=f"sqlite:///{DEFAULT_MODELDR}/umi_hp_optimization.db", help="URL for Optuna storage ")
     ap.add_argument("--model-dir", type=str, default=DEFAULT_MODELDR, help="directory where the model is saved")
@@ -831,8 +838,8 @@ if __name__ == "__main__":
         n_epochs=args.n_epochs,     # then trains for n_epochs
         batch_size=args.batch_size,
         retrain_delta=pd.DateOffset(days=args.retrain_delta),    # to modify if wanted hours or minutes
-        dynamic_universe_mult=2,    # 2x over-allocation for dynamic universe
-        tune_trials=5,              # number controlled per-job via TRIALS_PER_JOB env
+        dynamic_universe_mult=args.dynamic_universe_mult,    # 2x over-allocation for dynamic universe
+        n_trials=args.n_trials,              # number controlled per-job via TRIALS_PER_JOB env
         study_name=args.study_name,
         storage_url=args.storage_url,
         training_mode=args.training_mode,
