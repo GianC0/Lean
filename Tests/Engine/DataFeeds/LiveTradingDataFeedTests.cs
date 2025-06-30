@@ -1747,39 +1747,80 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             Log.Trace("Count: " + count + " ReaderCount: " + RestApiBaseData.ReaderCount);
         }
 
-        [TestCase(DataNormalizationMode.Raw)]
-        [TestCase(DataNormalizationMode.BackwardsRatio)]
-        [TestCase(DataNormalizationMode.BackwardsPanamaCanal)]
-        [TestCase(DataNormalizationMode.ForwardPanamaCanal)]
-        public void LivePriceScaling(DataNormalizationMode dataNormalizationMode)
+        [TestCase(DataNormalizationMode.Raw, true)]
+        [TestCase(DataNormalizationMode.BackwardsRatio, true)]
+        [TestCase(DataNormalizationMode.BackwardsPanamaCanal, true)]
+        [TestCase(DataNormalizationMode.ForwardPanamaCanal, true)]
+
+        [TestCase(DataNormalizationMode.Raw, false)]
+        [TestCase(DataNormalizationMode.BackwardsRatio, false)]
+        [TestCase(DataNormalizationMode.BackwardsPanamaCanal, false)]
+        [TestCase(DataNormalizationMode.ForwardPanamaCanal, false)]
+        public void LivePriceScaling(DataNormalizationMode dataNormalizationMode, bool warmup)
         {
-            var feed = RunDataFeed();
-            _algorithm.SetFinishedWarmingUp();
+            _startDate = new DateTime(2013, 10, 10);
+            _manualTimeProvider.SetCurrentTimeUtc(_startDate);
+
+            _algorithm.SetBenchmark(x => 1);
+            if (warmup)
+            {
+                _algorithm.SetWarmup(TimeSpan.FromDays(2));
+            }
+            else
+            {
+                _algorithm.SetFinishedWarmingUp();
+            }
+            var feed = RunDataFeed(runPostInitialize: false);
 
             var security = _algorithm.AddFuture("ES",
                 dataNormalizationMode: dataNormalizationMode);
             var symbol = security.Symbol;
+
+            _algorithm.PostInitialize();
 
             var receivedSecurityChanges = false;
             var receivedData = false;
 
             var assertPrice = new Action<decimal>((decimal price) =>
             {
-                if (dataNormalizationMode == DataNormalizationMode.ForwardPanamaCanal && price < 150)
+                ConsoleWriteLine($"assertPrice: {price} for {symbol} @{security.LocalTime}");
+                if (_algorithm.IsWarmingUp)
                 {
-                    throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    if (dataNormalizationMode == DataNormalizationMode.ForwardPanamaCanal && Math.Abs(price - 1760m) > 10)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.Raw && Math.Abs(price -1660m) > 10)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.BackwardsPanamaCanal && Math.Abs(price - 1510m) > 10)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.BackwardsRatio && Math.Abs(price - 1560m) > 10m)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
                 }
-                else if (dataNormalizationMode == DataNormalizationMode.Raw && price == 2)
+                else
                 {
-                    throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
-                }
-                else if (dataNormalizationMode == DataNormalizationMode.BackwardsPanamaCanal && price < -150)
-                {
-                    throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
-                }
-                else if (dataNormalizationMode == DataNormalizationMode.BackwardsRatio && Math.Abs(price - 1.48m) > price * 0.1m)
-                {
-                    throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    if (dataNormalizationMode == DataNormalizationMode.ForwardPanamaCanal && price < 90)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.Raw && Math.Abs(price - 2m) > 1)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.BackwardsPanamaCanal && price < -160)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
+                    else if (dataNormalizationMode == DataNormalizationMode.BackwardsRatio && Math.Abs(price - 1.48m) > price * 0.1m)
+                    {
+                        throw new RegressionTestException($"unexpected price {price} for {symbol} @{security.LocalTime}");
+                    }
                 }
             });
 
@@ -1792,6 +1833,11 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     {
                         receivedSecurityChanges = true;
                     }
+                }
+
+                if (warmup != _algorithm.IsWarmingUp)
+                {
+                    return;
                 }
 
                 if (ts.Slice.Bars.ContainsKey(symbol))
@@ -2731,6 +2777,129 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             Assert.IsFalse(emittedTradebars);
         }
 
+        [Test]
+        public void FillForwardsWarmUpDataToLiveFeed(
+            [Values(Resolution.Minute, Resolution.Daily)] Resolution warmupResolution,
+            [Values] bool fromHistoryProviderWarmUp,
+            [Values] bool withLiveDataPoint)
+        {
+            var symbol = Symbols.SPY;
+            TradeBar lastHistoryWarmUpBar = null;
+            if (fromHistoryProviderWarmUp)
+            {
+                _startDate = new DateTime(2025, 06, 12);
+
+                var historyBarTime = warmupResolution == Resolution.Minute ? _startDate.AddHours(-12) : _startDate.AddDays(-2);
+                lastHistoryWarmUpBar = new TradeBar(historyBarTime, symbol, 1, 1, 1, 1, 100, warmupResolution.ToTimeSpan());
+
+                var historyProvider = new Mock<IHistoryProvider>();
+                historyProvider
+                    .Setup(m => m.GetHistory(It.IsAny<IEnumerable<Data.HistoryRequest>>(), It.IsAny<DateTimeZone>()))
+                    .Returns(new List<Slice>
+                    {
+                        new Slice(lastHistoryWarmUpBar.EndTime,
+                            new List<BaseData> { lastHistoryWarmUpBar },
+                            lastHistoryWarmUpBar.EndTime.ConvertToUtc(TimeZones.NewYork))
+                    });
+                _algorithm.SetHistoryProvider(historyProvider.Object);
+            }
+            else
+            {
+                _startDate = new DateTime(2013, 10, 12);
+            }
+
+            _algorithm.Settings.DailyPreciseEndTime = false;
+            _algorithm.SetStartDate(_startDate);
+            _manualTimeProvider.SetCurrentTimeUtc(_algorithm.Time.ConvertToUtc(TimeZones.NewYork));
+
+            _algorithm.SetBenchmark(_ => 0);
+            _algorithm.SetWarmUp(warmupResolution == Resolution.Minute ? 60 * 8 : 10, warmupResolution);
+
+            var firstLiveBarTime = warmupResolution == Resolution.Minute
+                ? _startDate.AddHours(8)
+                : _startDate.AddHours(0.25);
+            var firstLiveBar = new TradeBar(firstLiveBarTime, symbol, 1, 5, 1, 3, 100, Time.OneMinute);
+            var liveData = withLiveDataPoint ? new List<BaseData> { firstLiveBar } : new List<BaseData>();
+            var dqh = new TestDataQueueHandler { DataPerSymbol = new() { { symbol, liveData } } };
+            var feed = RunDataFeed(Resolution.Minute, dataQueueHandler: dqh, equities: new() { "SPY" });
+            _algorithm.OnEndOfTimeStep();
+
+            TradeBar lastWarmupTradeBar = null;
+            TradeBar lastTradeBar = null;
+            var dataFillForwardedFromWarmupCount = 0;
+            var dataFillForwardedFromLiveCount = 0;
+            var gotLivePoint = false;
+
+            var stopTime = withLiveDataPoint ? firstLiveBar.EndTime.AddHours(0.25) : _startDate.AddHours(0.5);
+            if (warmupResolution == Resolution.Minute)
+            {
+                stopTime = withLiveDataPoint? firstLiveBar.EndTime.AddHours(1) : _startDate.AddHours(8);
+            }
+
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                if (ts.Slice.HasData)
+                {
+                    Assert.IsTrue(ts.Slice.Bars.TryGetValue(symbol, out var tradeBar));
+
+                    if (_algorithm.IsWarmingUp)
+                    {
+                        lastWarmupTradeBar = tradeBar;
+                    }
+                    else
+                    {
+                        lastTradeBar = tradeBar;
+
+                        if (lastTradeBar.EndTime == firstLiveBar.EndTime && withLiveDataPoint)
+                        {
+                            Assert.IsFalse(lastTradeBar.IsFillForward);
+                            gotLivePoint = true;
+                        }
+                        else
+                        {
+                            Assert.IsTrue(lastTradeBar.IsFillForward);
+
+                            if (!withLiveDataPoint || lastTradeBar.EndTime < firstLiveBar.EndTime)
+                            {
+                                dataFillForwardedFromWarmupCount++;
+                            }
+                            else if (withLiveDataPoint && lastTradeBar.EndTime > firstLiveBar.EndTime)
+                            {
+                                dataFillForwardedFromLiveCount++;
+                            }
+                        }
+
+                        if (tradeBar.EndTime >= stopTime)
+                        {
+                            // short cut
+                            _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                        }
+                    }
+                }
+            },
+            endDate: _startDate.AddDays(60),
+            secondsTimeStep: 60);
+
+            // Assert we actually got warmup data
+            Assert.IsNotNull(lastWarmupTradeBar);
+
+            // Assert we got normal data
+            Assert.IsNotNull(lastTradeBar);
+
+            // Assert we got fill-forwarded data before the actual live data
+            Assert.Greater(dataFillForwardedFromWarmupCount, 0);
+
+            // Assert we got fill-forwarded data after the actual live data
+            if (withLiveDataPoint)
+            {
+                Assert.IsTrue(gotLivePoint);
+                Assert.Greater(dataFillForwardedFromLiveCount, 0);
+            }
+            else
+            {
+                Assert.AreEqual(0, dataFillForwardedFromLiveCount);
+            }
+        }
 
         private IDataFeed RunDataFeed(Resolution resolution = Resolution.Second, List<string> equities = null, List<string> forex = null, List<string> crypto = null,
             Func<FuncDataQueueHandler, IEnumerable<BaseData>> getNextTicksFunction = null,

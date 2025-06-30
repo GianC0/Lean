@@ -535,6 +535,25 @@ namespace QuantConnect.Algorithm
         }
 
         /// <summary>
+        /// Creates a new Chaikin Oscillator indicator.
+        /// </summary>
+        /// <param name="symbol">The symbol whose CO we want</param>
+        /// <param name="fastPeriod">The fast moving average period</param>
+        /// <param name="slowPeriod">The slow moving average period</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to the Value property of BaseData (x => x.Value)</param>
+        /// <returns>The Chaikin Oscillator indicator for the requested symbol over the specified period</returns>
+        [DocumentationAttribute(Indicators)]
+        public ChaikinOscillator CO(Symbol symbol, int fastPeriod, int slowPeriod, Resolution? resolution = null, Func<IBaseData, TradeBar> selector = null)
+        {
+            var name = CreateIndicatorName(symbol, $"CO({fastPeriod},{slowPeriod})", resolution);
+            var chaikinOscillator = new ChaikinOscillator(name, fastPeriod, slowPeriod);
+            InitializeIndicator(chaikinOscillator, resolution, selector, symbol);
+
+            return chaikinOscillator;
+        }
+
+        /// <summary>
         /// Creates a new ChandeMomentumOscillator indicator.
         /// </summary>
         /// <param name="symbol">The symbol whose CMO we want</param>
@@ -1204,6 +1223,56 @@ namespace QuantConnect.Algorithm
             InitializeIndicator(keltnerChannels, resolution, selector, symbol);
 
             return keltnerChannels;
+        }
+
+        /// <summary>
+        /// Creates a new KnowSureThing indicator for the symbol. The indicator will be automatically
+        /// updated on the given resolution.
+        /// </summary>
+        /// <param name="symbol">The symbol whose KST we want</param>
+        /// <param name="roc1Period">The period over which to compute ROC1</param>
+        /// <param name="roc1MaPeriod">The smoothing period used to smooth the computed ROC1 values</param>
+        /// <param name="roc2Period">The period over which to compute ROC2</param>
+        /// <param name="roc2MaPeriod">The smoothing period used to smooth the computed ROC2 values</param>
+        /// <param name="roc3Period">The period over which to compute ROC3</param>
+        /// <param name="roc3MaPeriod">The smoothing period used to smooth the computed ROC3 values</param>
+        /// <param name="roc4Period">The period over which to compute ROC4</param>
+        /// <param name="roc4MaPeriod">The smoothing period used to smooth the computed ROC4 values</param>
+        /// <param name="signalPeriod">The smoothing period used to smooth the signal values</param>
+        /// <param name="movingAverageType">Specifies the type of moving average to be used as smoother for KnowSureThing values</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a TradeBar</param>
+        /// <returns>A new KnowSureThing indicator with the specified smoothing type and period</returns>
+        [DocumentationAttribute(Indicators)]
+        public KnowSureThing KST(Symbol symbol,
+            int roc1Period = 10, int roc1MaPeriod = 10, int roc2Period = 15, int roc2MaPeriod = 10,
+            int roc3Period = 20, int roc3MaPeriod = 10, int roc4Period = 30, int roc4MaPeriod = 15, int signalPeriod = 9,
+            MovingAverageType movingAverageType = MovingAverageType.Simple,
+            Resolution? resolution = null, Func<IBaseData, decimal> selector = null)
+        {
+            var name = CreateIndicatorName(symbol, $"KST({roc1Period},{roc1MaPeriod},{roc2Period},{roc2MaPeriod},{roc3Period},{roc3MaPeriod},{roc4Period},{roc4MaPeriod},{signalPeriod},{movingAverageType})", resolution);
+            var indicator = new KnowSureThing(name, roc1Period, roc1MaPeriod, roc2Period, roc2MaPeriod, roc3Period, roc3MaPeriod, roc4Period, roc4MaPeriod, signalPeriod, movingAverageType);
+            InitializeIndicator(indicator, resolution, selector, symbol);
+            return indicator;
+        }
+
+        /// <summary>
+        /// Creates a new Klinger Volume Oscillator (KVO) indicator
+        /// </summary>
+        /// <param name="symbol">The symbol whose KVO we want</param>
+        /// <param name="fastPeriod">The period of the fast EMA used to calculate KVO</param>
+        /// <param name="slowPeriod">The period of the slow EMA used to calculate KVO, default to 13</param>
+        /// <param name="signalPeriod">The period of the signal EMA of the raw KVO value</param>
+        /// <param name="resolution">The resolution.</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a TradeBar</param>
+        /// <returns>The Klinger Volume Oscillator indicator for the requested symbol.</returns>
+        [DocumentationAttribute(Indicators)]
+        public KlingerVolumeOscillator KVO(Symbol symbol, int fastPeriod, int slowPeriod, int signalPeriod = 13, Resolution? resolution = null, Func<IBaseData, TradeBar> selector = null)
+        {
+            var name = CreateIndicatorName(symbol, $"KVO({fastPeriod},{slowPeriod},{signalPeriod})", resolution);
+            var klingerVolumeOscillator = new KlingerVolumeOscillator(name, fastPeriod, slowPeriod, signalPeriod);
+            InitializeIndicator(klingerVolumeOscillator, resolution, selector, symbol);
+            return klingerVolumeOscillator;
         }
 
         /// <summary>
@@ -1948,6 +2017,33 @@ namespace QuantConnect.Algorithm
             InitializeIndicator(sortinoRatio, resolution, selector, symbol);
 
             return sortinoRatio;
+        }
+
+        /// <summary>
+        /// Creates a new Parabolic SAR Extended indicator
+        /// </summary>
+        /// <param name="symbol">The symbol whose SAREXT we seek</param>
+        /// <param name="sarStart">The starting value for the Stop and Reverse indicator</param>
+        /// <param name="offsetOnReverse">The offset value to be applied on reverse </param>
+        /// <param name="afStartShort">The starting acceleration factor for short positions</param>
+        /// <param name="afIncrementShort">The increment value for the acceleration factor for short positions</param>
+        /// <param name="afMaxShort">The maximum value for the acceleration factor for short positions</param>
+        /// <param name="afStartLong">The starting acceleration factor for long positions</param>
+        /// <param name="afIncrementLong">The increment value for the acceleration factor for long positions</param>
+        /// <param name="afMaxLong">The maximum value for the acceleration factor for long positions</param>
+        /// <param name="resolution">The resolution</param>
+        /// <param name="selector">Selects a value from the BaseData to send into the indicator, if null defaults to casting the input value to a TradeBar</param>
+        /// <returns>A ParabolicStopAndReverseExtended configured with the specified periods</returns>
+        [DocumentationAttribute(Indicators)]
+        public ParabolicStopAndReverseExtended SAREXT(Symbol symbol, decimal sarStart = 0.0m, decimal offsetOnReverse = 0.0m, decimal afStartShort = 0.02m, 
+            decimal afIncrementShort = 0.02m, decimal afMaxShort = 0.2m, decimal afStartLong = 0.02m, decimal afIncrementLong = 0.02m, decimal afMaxLong = 0.2m,
+            Resolution? resolution = null, Func<IBaseData, IBaseDataBar> selector = null)
+        {
+            var name = CreateIndicatorName(symbol, $"SAREXT({sarStart},{offsetOnReverse},{afStartShort},{afIncrementShort},{afMaxShort},{afStartLong},{afIncrementLong},{afMaxLong})", resolution);
+            var parabolicStopAndReverseExtended = new ParabolicStopAndReverseExtended(name, sarStart, offsetOnReverse, afStartShort, afIncrementShort, afMaxShort, afStartLong, afIncrementLong, afMaxLong);
+            InitializeIndicator(parabolicStopAndReverseExtended, resolution, selector, symbol);
+
+            return parabolicStopAndReverseExtended;
         }
 
         /// <summary>

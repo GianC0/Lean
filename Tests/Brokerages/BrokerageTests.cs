@@ -171,11 +171,6 @@ namespace QuantConnect.Tests.Brokerages
             {
                 Log.Trace("FILL EVENT: " + orderEvent.FillQuantity + " units of " + orderEvent.Symbol.ToString());
 
-                if (orderEvent.Status == OrderStatus.Filled)
-                {
-                    OrderFillEvent.Set();
-                }
-
                 var eventFillPrice = orderEvent.FillPrice;
                 var eventFillQuantity = orderEvent.FillQuantity;
 
@@ -197,10 +192,15 @@ namespace QuantConnect.Tests.Brokerages
                 holding.SetHoldings(eventFillPrice, holding.Quantity + eventFillQuantity);
 
                 Log.Trace("--HOLDINGS: " + _securityProvider[orderEvent.Symbol].Holdings);
+            }
 
-                // update order mapping
-                var order = _orderProvider.GetOrderById(orderEvent.OrderId);
-                order.Status = orderEvent.Status;
+            // update order mapping
+            var order = _orderProvider.GetOrderById(orderEvent.OrderId);
+            order.Status = orderEvent.Status;
+            if (orderEvent.Status == OrderStatus.Filled)
+            {
+                // set the event after we actually update the order status
+                OrderFillEvent.Set();
             }
         }
 
@@ -249,7 +249,7 @@ namespace QuantConnect.Tests.Brokerages
             {
                 if (holding.Quantity == 0) continue;
                 Log.Trace("Liquidating: " + holding);
-                var order = new MarketOrder(holding.Symbol, -holding.Quantity, DateTime.UtcNow);
+                var order = GetMarketOrder(holding.Symbol, -holding.Quantity);
                 PlaceOrderWaitForStatus(order, OrderStatus.Filled);
             }
         }
@@ -549,7 +549,7 @@ namespace QuantConnect.Tests.Brokerages
             Log.Trace("");
             var before = Brokerage.GetAccountHoldings();
 
-            PlaceOrderWaitForStatus(new MarketOrder(Symbol, GetDefaultQuantity(), DateTime.UtcNow));
+            PlaceOrderWaitForStatus(GetMarketOrder(Symbol, GetDefaultQuantity()));
 
             Thread.Sleep(3000);
 
@@ -588,7 +588,7 @@ namespace QuantConnect.Tests.Brokerages
 
             // pick a security with low, but some, volume
             var symbol = Symbols.EURUSD;
-            var order = new MarketOrder(symbol, qty, DateTime.UtcNow) { Id = 1 };
+            var order = GetMarketOrder(symbol, qty);
             OrderProvider.Add(order);
             Brokerage.PlaceOrder(order);
 
@@ -631,7 +631,7 @@ namespace QuantConnect.Tests.Brokerages
             Log.Trace("MODIFY UNTIL FILLED: " + order);
             Log.Trace("");
             var stopwatch = Stopwatch.StartNew();
-            while (order.Status != OrderStatus.Filled && !OrderFillEvent.WaitOne(3000) && stopwatch.Elapsed.TotalSeconds < secondsTimeout)
+            while (!order.Status.IsClosed() && !OrderFillEvent.WaitOne(3000) && stopwatch.Elapsed.TotalSeconds < secondsTimeout)
             {
                 OrderFillEvent.Reset();
                 if (order.Status == OrderStatus.PartiallyFilled) continue;
@@ -642,7 +642,7 @@ namespace QuantConnect.Tests.Brokerages
                 var updateOrder = parameters.ModifyOrderToFill(Brokerage, order, marketPrice);
                 if (updateOrder)
                 {
-                    if (order.Status == OrderStatus.Filled)
+                    if (order.Status.IsClosed())
                     {
                         break;
                     }
@@ -650,15 +650,13 @@ namespace QuantConnect.Tests.Brokerages
                     Log.Trace("BrokerageTests.ModifyOrderUntilFilled(): " + order);
                     if (!Brokerage.UpdateOrder(order))
                     {
-                        if (order.Status != OrderStatus.Filled)
-                        {
-                            Assert.Fail("Brokerage failed to update the order");
-                        }
+                        // could be filling already, partial fill
                     }
                 }
             }
-
             Brokerage.OrdersStatusChanged -= brokerageOnOrdersStatusChanged;
+
+            Assert.AreEqual(OrderStatus.Filled, order.Status, $"Brokerage failed to update the order: {order.Status}");
         }
 
         /// <summary>
@@ -685,7 +683,13 @@ namespace QuantConnect.Tests.Brokerages
                     Log.Trace("");
                     Log.Trace("SUBMITTED: " + orderEvent);
                     Log.Trace("");
-                    requiredStatusEvent.Set();
+                    try
+                    {
+                        requiredStatusEvent.Set();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
                 }
                 // make sure we fire the status we're expecting
                 if (orderEvent.Status == expectedStatus)
@@ -693,7 +697,13 @@ namespace QuantConnect.Tests.Brokerages
                     Log.Trace("");
                     Log.Trace("EXPECTED: " + orderEvent);
                     Log.Trace("");
-                    desiredStatusEvent.Set();
+                    try
+                    {
+                        desiredStatusEvent.Set();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
                 }
             };
 
@@ -765,5 +775,10 @@ namespace QuantConnect.Tests.Brokerages
             }, cancellationToken.Token);
         }
 
+        private MarketOrder GetMarketOrder(Symbol symbol, decimal quantity)
+        {
+            var properties = SymbolPropertiesDatabase.FromDataFolder().GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, Brokerage?.AccountBaseCurrency ?? Currencies.USD);
+            return new MarketOrder(symbol, quantity, DateTime.UtcNow) { Id = 1, PriceCurrency = properties.QuoteCurrency };
+        }
     }
 }

@@ -44,7 +44,8 @@ public class MarketOnCloseOrderTestParameters : MarketOrderTestParameters
     {
         return new MarketOnCloseOrder(Symbol, -Math.Abs(quantity), DateTime.UtcNow, properties: Properties)
         {
-            OrderSubmissionData = OrderSubmissionData
+            OrderSubmissionData = OrderSubmissionData,
+            PriceCurrency = GetSymbolProperties(Symbol).QuoteCurrency
         };
     }
 
@@ -57,7 +58,8 @@ public class MarketOnCloseOrderTestParameters : MarketOrderTestParameters
     {
         return new MarketOnCloseOrder(Symbol, Math.Abs(quantity), DateTime.UtcNow, properties: Properties)
         {
-            OrderSubmissionData = OrderSubmissionData
+            OrderSubmissionData = OrderSubmissionData,
+            PriceCurrency = GetSymbolProperties(Symbol).QuoteCurrency
         };
     }
 
